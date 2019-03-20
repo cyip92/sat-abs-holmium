@@ -3,6 +3,8 @@ import numpy
 import ctypes
 import matplotlib.pyplot as plt
 from operator import itemgetter
+from tqdm import tqdm
+import Queue
 
 
 def sample_data(num_samples, sample_rate_in_hz, num_channels):
@@ -92,8 +94,6 @@ def process_data():
     """
     x2 = []
     y2 = []
-    x_single = []
-    y_single = []
     i = 0
     num_ramps = 0
     while i < len(x1) - 1:
@@ -109,36 +109,62 @@ def process_data():
             x2.extend(curr_x)
             y2.extend(curr_y)
             num_ramps += 1
-            if len(x_single) == 0:
-                x_single.append(curr_x)
-                y_single.append(curr_y)
         i += 1
     print "Found %d valid sweeps" % num_ramps
 
-    """
-    Since the x-axis values are also taken from a 16-bit analog input, they are for the most part distinct.  The
-    most straightforward way is to calculate a moving average, in this case with a window size of
-        num_ramps * ramp_jaggedness
-    """
-    # Combine and sort all ramps
+    # Combine and sort all data points from the ramps in ascending x-value order
     xy_pairs = []
     for i in range(len(x2)):
         xy_pairs.append([x2[i], y2[i]])
     xy_pairs.sort(key=itemgetter(0))
 
-    # Perform the moving average
+    """
+    The electronics on the actual saturated absorption setup cause the baseline doppler-broadened curve to be slightly
+    different between different data sets, so a baseline curve is calculated by performing a moving average with a
+    very large moving window (in this case 20% of the entire span) in order to effectively remove the spectroscopy
+    signal from the doppler-broadened curve.
+    """
+    xb = []
+    yb = []
+    moving_avg_size = len(x2) / 5
+    avg = Queue.Queue(maxsize=moving_avg_size)
+    curr_total = 0
+    for i in range(moving_avg_size/2):
+        avg.put(xy_pairs[i][1])
+        curr_total += xy_pairs[i][1]
+    for i in tqdm(range(len(x2)), ascii=True):
+        adjusted_index = i + moving_avg_size/2
+        if avg.full() or adjusted_index > moving_avg_size:
+            curr_total -= avg.get()
+        if adjusted_index < len(x2):
+            avg.put(xy_pairs[adjusted_index][1])
+            curr_total += xy_pairs[adjusted_index][1]
+        xb.append(xy_pairs[i][0])
+        yb.append(curr_total / avg.qsize())
+
+    """
+    Now the actual spectroscopy data itself is constructed with a moving average, in this case with a window size of
+        num_ramps * ramp_jaggedness
+    with the baseline doppler-broadened curve subtracted out.
+    """
     x3 = []
     y3 = []
-    adj_points = num_ramps * ramp_jaggedness / 2
-    for i in range(len(x2)):
-        i_min = max(0, i - adj_points)
-        i_max = min(len(x2), i + adj_points)
-        num_points = i_max - i_min
-        adj_xy = xy_pairs[i_min:i_max]
+    moving_avg_size = num_ramps * ramp_jaggedness / 2
+    avg = Queue.Queue(maxsize=moving_avg_size)
+    curr_total = 0
+    for i in range(moving_avg_size / 2):
+        avg.put(xy_pairs[i][1])
+        curr_total += xy_pairs[i][1]
+    for i in tqdm(range(len(x2)), ascii=True):
+        adjusted_index = i + moving_avg_size / 2
+        if avg.full() or adjusted_index > moving_avg_size:
+            curr_total -= avg.get()
+        if adjusted_index < len(x2):
+            avg.put(xy_pairs[adjusted_index][1])
+            curr_total += xy_pairs[adjusted_index][1]
         x3.append(xy_pairs[i][0])
-        y3.append(sum([adj_xy[j][1] for j in range(num_points)]) / num_points)
+        y3.append(curr_total / avg.qsize() - yb[i])
 
-    plt.scatter(x_single, y_single, s=0.5)
     plt.scatter(x3, y3, s=0.5)
     plt.xlabel('Ramp Voltage (V)')
     plt.ylabel('Preamp Output (V)')
