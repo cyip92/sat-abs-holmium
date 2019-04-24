@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 from operator import itemgetter
 from tqdm import tqdm
 import Queue
+from sympy.physics.wigner import wigner_6j
+import serial
 
 
 def sample_data(num_samples, sample_rate_in_hz, num_channels):
@@ -25,11 +27,14 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels):
     analog_in_location = "Dev1/ai0:1"
     task_handle = pydaqmx.TaskHandle()
     read = ctypes.c_long(0)
-    data = numpy.zeros((num_channels * num_samples,), dtype=numpy.float64)
+    read_segments = 100
+    segment_data = numpy.zeros((num_channels * num_samples / read_segments,), dtype=numpy.float64)
+    analog_data = numpy.zeros((0,), dtype=numpy.float64)
     try:
-        # Read the data
-        print "Taking %d samples at %d Hz (%f seconds)" % (num_samples, sample_rate_in_hz,
-                                                           1.0 * num_samples / sample_rate_in_hz)
+        print "Taking {} samples at {} Hz ({} seconds)".format(num_samples, sample_rate_in_hz,
+                                                               1.0 * num_samples / sample_rate_in_hz)
+
+        # Set up connection to Analog In
         min_voltage = -10.0
         max_voltage = 10.0
         pydaqmx.DAQmxCreateTask("", pydaqmx.byref(task_handle))
@@ -39,16 +44,37 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels):
                                       pydaqmx.DAQmx_Val_ContSamps, num_samples)
         pydaqmx.DAQmxStartTask(task_handle)
         read_timeout = 10.0
-        print "Reading data..."
-        pydaqmx.DAQmxReadAnalogF64(task_handle, num_samples, read_timeout, pydaqmx.DAQmx_Val_GroupByChannel, data,
-                                   num_channels * num_samples, read, None)
-        print "Acquired %d points" % read.value
 
+        # Set up RS-232 communication with Frequency Counter
+        ser = serial.Serial(port='COM4', baudrate=9600, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                            stopbits=serial.STOPBITS_ONE, timeout=10)
+
+        """
+        Read all Analog In data as a batch; for info on DAQmxReadAnalogF64() see
+            https://www.ge.infn.it/~didomizi/documenti/daq/Ni_Docs/software/daqmxcfunc.chm/daqmxreadanalogf64.html
+        The most important info is that it reads {2nd argument} samples per channel into the array {5th argument}.
+        This actually interleaves reading from the Analog In and frequency counter by alternating readings between
+        them a total of read_segments times.  This is done so the frequency counter communication doesn't time-out,
+        and in practice read time is negligible, so this can be done without affecting the data itself.
+        """
+        print "Reading data, split into {} segments each {} seconds long"\
+              .format(read_segments, num_samples / sample_rate_in_hz / read_segments)
+        counter_data = numpy.zeros((0,), dtype=numpy.float64)
+        for segment in range(read_segments):
+            pydaqmx.DAQmxReadAnalogF64(task_handle, num_samples / read_segments, read_timeout,
+                                       pydaqmx.DAQmx_Val_GroupByScanNumber, segment_data, num_channels * num_samples,
+                                       read, None)
+            while ser.inWaiting():
+                next_freq = float(ser.readline().replace(',', '').split(' ')[0])
+                counter_data = numpy.append(counter_data, next_freq)
+            analog_data = numpy.append(analog_data, segment_data)
+
+        # Save Analog In data to a file
         f = open("data.npy", mode='wb+')
-        numpy.save(f, data)
+        numpy.save(f, numpy.append(analog_data, counter_data))
         print "Data written to file"
 
-        return data
+        print counter_data
 
     except pydaqmx.DAQError as err:
         print "DAQmx Error: %s" % err
@@ -56,6 +82,30 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels):
         if task_handle:
             pydaqmx.DAQmxStopTask(task_handle)
             pydaqmx.DAQmxClearTask(task_handle)
+
+
+def plot_raw_data(num_analog_samples):
+    f = open("data.npy", mode='rb+')
+    all_data = numpy.load(f)
+
+    # Analog input data
+    analog_data = all_data[:num_analog_samples]
+    num_channels = 2
+    samples_per_channel = len(analog_data) / num_channels
+    x_analog = range(samples_per_channel)
+    y1 = [analog_data[num_channels * i] for i in range(samples_per_channel)]
+    y2 = [analog_data[num_channels * i + 1] for i in range(samples_per_channel)]
+    plt.plot(x_analog, y1)
+
+    # Frequency counter data (rescaled to be -5 to +5)
+    counter_data = all_data[num_analog_samples:]
+    x_counter = numpy.linspace(0, num_analog_samples, len(counter_data))
+    min_freq = min(counter_data)
+    max_freq = max(counter_data)
+    y_counter = [10 * (counter_data[i] - min_freq) / (max_freq - min_freq) - 5 for i in range(len(counter_data))]
+    plt.plot(x_counter, y_counter)
+
+    plt.show()
 
 
 def process_data():
@@ -121,20 +171,20 @@ def process_data():
     """
     The electronics on the actual saturated absorption setup cause the baseline doppler-broadened curve to be slightly
     different between different data sets, so a baseline curve is calculated by performing a moving average with a
-    very large moving window (in this case 20% of the entire span) in order to effectively remove the spectroscopy
+    very large moving window (in this case 10% of the entire span) in order to effectively remove the spectroscopy
     signal from the doppler-broadened curve.
     """
     xb = []
     yb = []
-    moving_avg_size = len(x2) / 5
-    avg = Queue.Queue(maxsize=moving_avg_size)
+    bg_avg_size = len(x2) / 10
+    avg = Queue.Queue(maxsize=bg_avg_size)
     curr_total = 0
-    for i in range(moving_avg_size/2):
+    for i in range(bg_avg_size/2):
         avg.put(xy_pairs[i][1])
         curr_total += xy_pairs[i][1]
     for i in tqdm(range(len(x2)), ascii=True):
-        adjusted_index = i + moving_avg_size/2
-        if avg.full() or adjusted_index > moving_avg_size:
+        adjusted_index = i + bg_avg_size/2
+        if avg.full() or adjusted_index > bg_avg_size:
             curr_total -= avg.get()
         if adjusted_index < len(x2):
             avg.put(xy_pairs[adjusted_index][1])
@@ -165,17 +215,69 @@ def process_data():
         x3.append(xy_pairs[i][0])
         y3.append(curr_total / avg.qsize() - yb[i])
 
-    plt.scatter(x3, y3, s=0.5)
+    """
+    The signal tends to behave weirdly at the edges due to the way the moving averages are done; trim the edges by
+    an amount equal to the BG-subtraction window size 
+    """
+    x4 = [x3[i] for i in range(bg_avg_size, len(x3) - bg_avg_size)]
+    y4 = [y3[i] for i in range(bg_avg_size, len(y3) - bg_avg_size)]
+
+    # Plotting code to show processed data for visual checking
+    plt.scatter(x4, y4, s=0.5)
     plt.xlabel('Ramp Voltage (V)')
     plt.ylabel('Preamp Output (V)')
     plt.show()
 
     return [(x3[i], y3[i]) for i in range(len(x3))]
 
-'''
+
+def saturated_absorption_peaks(Ae, Be, x_scale, x_offset, y_scale):
+    # Atomic structure parameters (exact spin values, assumed ground state hyperfine)
+    I = 7 / 2.
+    Jg = 15 / 2.
+    Je = 17 / 2.
+    Ag = 800.58
+    Bg = -1668
+
+    transitions = []
+    for Fg in range(4, 12):
+        Fe = Fg + 1
+        Kg = Fg*(Fg+1) - I*(I+1) - Jg*(Jg+1)
+        Ke = Fe*(Fe+1) - I*(I+1) - Je*(Je+1)
+        Ug = Ag*Kg / 2 + Bg * (3/2.*Kg*(Kg+1) - 2*I*(I+1)*Jg*(Jg+1)) / (4*I*(2*I-1)*Jg*(2*Jg-1))
+        Ue = Ae*Ke / 2 + Be * (3/2.*Ke*(Ke+1) - 2*I*(I+1)*Je*(Je+1)) / (4*I*(2*I-1)*Je*(2*Je-1))
+        peak_height = pow(wigner_6j(Jg, I, Fg, Fe, 1, Je), 2) * ((2*Fg + 1) * (2*Fe + 1))
+        transitions.append((x_scale * (Ue - Ug - x_offset), peak_height * y_scale))
+    return transitions
+
+
+def saturated_absorption_signal(transitions, linewidth):
+    low_x = min([a[0] for a in transitions]) - 5*linewidth
+    high_x = max([a[0] for a in transitions]) + 5*linewidth
+    x = numpy.linspace(low_x, high_x, 2000)
+    y = [sum([transitions[j][1] / (1 + pow((x[i] - transitions[j][0]) / linewidth, 2))
+              for j in range(len(transitions))]) for i in range(len(x))]
+
+    plt.scatter(x, y, s=0.5)
+    plt.xlabel('Detuning (MHz)')
+    plt.ylabel('Absorption Signal (arb.)')
+    plt.show()
+
+
+def read_rs232():
+    ser = serial.Serial(port='COM4', baudrate=9600, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+                        stopbits=serial.STOPBITS_ONE, timeout=10)
+    while ser.inWaiting():
+        print float(ser.readline().split(' ')[0])
+
+
 # Read data from the analog in
-numSamples = 300000
+numSamples = 500000
 numChannels = 2
 sampleRateInHz = 100000.0
-sample_data(numSamples, sampleRateInHz, numChannels)'''
-process_data()
+sample_data(numSamples, sampleRateInHz, numChannels)
+plot_raw_data(numSamples * numChannels)
+# process_data()
+# transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
+# saturated_absorption_signal(transitions, 10)
+# read_rs232()
