@@ -124,18 +124,44 @@ def plot_raw_data(num_analog_samples, time_span):
     f = open("data1.npy", mode='rb+')
     all_data = numpy.load(f)
 
-    # Analog input data
+    # Analog input data (index 2n+1 is spectroscopy signal)
     analog_data = all_data[:num_analog_samples]
     num_channels = 2
     samples_per_channel = len(analog_data) / num_channels
     x_analog = numpy.linspace(0, time_span, samples_per_channel)
-    y1 = [analog_data[num_channels * i+1] for i in range(samples_per_channel)]
+    y1 = [analog_data[num_channels * i + 1] for i in range(samples_per_channel)]
     print "{} analog points ({} Hz)".format(len(x_analog), len(x_analog) / time_span)
 
     # Frequency counter data
     counter_data = all_data[num_analog_samples:]
     x_counter = numpy.linspace(0, time_span, len(counter_data))
     print "{} counter points ({} Hz)".format(len(x_counter), len(x_counter) / time_span)
+
+    """
+    Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
+    an abs() operation on a noisy triangle ramp.  It does this by tracking and toggling some variables based on
+    derivative changes and closeness to zero.
+    
+    What happens on the experiment is that the relative frequency of the two lasers sweeps past zero and is actually
+    scanning from a negative value to a positive value, but the frequency counter only ever reads a positive value.
+    """
+    is_output_inverted = False
+    index_margin = 10
+    zero_margin = 50
+    data_slope_increasing = counter_data[index_margin] - counter_data[0] > 0
+    unfolded_counter_data = numpy.zeros((len(counter_data),), dtype=numpy.float64)
+    for i in range(index_margin):
+        unfolded_counter_data[i] = counter_data[i]
+    for i in range(index_margin, len(counter_data)):
+        curr_data_slope_increasing = counter_data[i] - counter_data[i - index_margin] > 0
+        if curr_data_slope_increasing != data_slope_increasing:
+            if not data_slope_increasing:
+                is_output_inverted = not is_output_inverted
+            data_slope_increasing = curr_data_slope_increasing
+            if abs(counter_data[i]) < zero_margin:
+                for j in range(index_margin / 2 + 1):
+                    unfolded_counter_data[i - j] *= -1
+        unfolded_counter_data[i] = counter_data[i] * (-1 if is_output_inverted else 1)
 
     # Plot both on the same plot
     fig, ax1 = plt.subplots()
@@ -144,7 +170,7 @@ def plot_raw_data(num_analog_samples, time_span):
     ax1.plot(x_analog, y1, color='r')
     ax2 = ax1.twinx()
     ax2.set_ylabel('Frequency Counter (MHz)', color='b')
-    ax2.plot(x_counter, counter_data, color='b')
+    ax2.plot(x_counter, unfolded_counter_data, color='b')
     plt.show()
 
 
@@ -315,7 +341,7 @@ def read_rs232():
 numSamples = 500000
 numChannels = 2
 sampleRateInHz = 100000.0
-#sample_data(numSamples, sampleRateInHz, numChannels)
+# sample_data(numSamples, sampleRateInHz, numChannels)
 plot_raw_data(numSamples * numChannels, numSamples / sampleRateInHz)
 # process_data()
 # transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
