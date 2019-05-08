@@ -11,43 +11,56 @@ import pyvisa as visa
 import time
 
 
-def sample_data(num_samples, sample_rate_in_hz, num_channels):
+def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
     """
     Read data from specified analog input channels at with a specified rate and duration.  Default channels to be
     read are 0 and 1, which should be changed via analog_in_location (within the function code) in order to suit
-    particular experimental configurations.  The formatting of the taken data is such that all samples from the 1st
-    channel will be contiguous, followed by all the samples in the second channel, and so on.  This also saves the
-    data into a file "data.npy" in a local directory.
+    particular experimental configurations.  The formatting of the data are as an array with the following segments:
+        header_segment:     (header_length, analog_length, sample_rate_hz, channel_count)
+        analog_segment:     An array of length num_samples*num_channels arranged such that the points from all channels
+            are interleaved, eg. [ch0/t=0, ch1/t=0, ch0/t=1, ch1/t=1, ... ]
+        counter_segment:    A single long array of counter values which, for the purposes of analysis, should be
+            assumed to be taken over the same time span as the analog data
 
-    :param num_samples: Number of data points to take per analog input channel
-    :param sample_rate_in_hz: Number of data points taken per second
-    :param num_channels: Number of channels to read data from (analog_in_location must be modified if not reading
+    :param num_samples:         Number of data points to take per analog input channel
+    :param sample_rate_in_hz:   Number of data points taken per second
+    :param num_channels:        Number of channels to read data from (analog_in_location must be modified if not reading
         from the first two channels)
-    :return: Analog input values from the specified channels
+    :param file_name:           Number of the file to save data into (assumed to be local directory)
+    :return:                    None (writes data into "data.npy")
     """
     # This assumes the specified channels are the first ones
     analog_in_location = "Dev1/ai0:1"
     task_handle = pydaqmx.TaskHandle()
     read = ctypes.c_long(0)
-    read_segments = 10
+    read_segments = 100
+    header_segment = numpy.array([4, num_samples, sample_rate_in_hz, num_channels])
     segment_data = numpy.zeros((num_channels * num_samples / read_segments,), dtype=numpy.float64)
-    analog_data = numpy.zeros((0,), dtype=numpy.float64)
+    analog_segment = numpy.zeros((0,), dtype=numpy.float64)
     try:
-        print "Taking {} samples at {} Hz ({} seconds)".format(num_samples, sample_rate_in_hz,
+        print "Taking {} samples at {} Hz ({} seconds)".format(num_samples,
+                                                               sample_rate_in_hz,
                                                                1.0 * num_samples / sample_rate_in_hz)
 
         # Set up connection to Analog In
         min_voltage = -10.0
         max_voltage = 10.0
+        read_timeout = 10.0
         pydaqmx.DAQmxCreateTask("", pydaqmx.byref(task_handle))
         pydaqmx.DAQmxCreateAIVoltageChan(task_handle, analog_in_location, "", pydaqmx.DAQmx_Val_Cfg_Default,
                                          min_voltage, max_voltage, pydaqmx.DAQmx_Val_Volts, None)
         pydaqmx.DAQmxCfgSampClkTiming(task_handle, "", sample_rate_in_hz, pydaqmx.DAQmx_Val_Rising,
                                       pydaqmx.DAQmx_Val_ContSamps, num_samples)
         pydaqmx.DAQmxStartTask(task_handle)
-        read_timeout = 10.0
 
-        # Set up GPIB communication with Frequency Counter
+        """
+        Set up GPIB communication with Frequency Counter; for other experimental setups that try to use this, you will
+        need to use pyvisa to query for what all the available connections are.  In order to do this in the console:
+            import pyvisa as visa
+            visa.ResourceManager().list_resources()
+        
+        See https://pyvisa.readthedocs.io/en/master/ for more tips if needed.
+        """
         rm = visa.ResourceManager()
         inst = rm.open_resource('GPIB::3::INSTR')
         initialize_frequency_counter_state(inst)
@@ -56,34 +69,43 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels):
         Read all Analog In data as a batch; for info on DAQmxReadAnalogF64() see
             https://www.ge.infn.it/~didomizi/documenti/daq/Ni_Docs/software/daqmxcfunc.chm/daqmxreadanalogf64.html
         The most important info is that it reads {2nd argument} samples per channel into the array {5th argument}.
+        
         This actually interleaves reading from the Analog In and frequency counter by alternating readings between
         them a total of read_segments times.  It reads all the data from the analog in (which takes negligible time)
         and then reads from the frequency counter repeatedly until the segment time elapses.  This needs to be done
-        because the GPIB port on the frequency counter can read quickly but doesn't seem to have a buffer
+        because the GPIB port on the frequency counter can read quickly but doesn't seem to have a buffer.
         """
-        segment_time = num_samples / sample_rate_in_hz / read_segments
-        print "Reading data, split into {} segments each {} seconds long"\
-              .format(read_segments, segment_time)
-        counter_data = numpy.zeros((0,), dtype=numpy.float64)
+        segment_time = 1.0 * num_samples / sample_rate_in_hz / read_segments
+        print "Reading data, split into {} segments each {} seconds long".format(read_segments, segment_time)
+        counter_segment = numpy.zeros((0,), dtype=numpy.float64)
         for segment in range(read_segments):
-            pydaqmx.DAQmxReadAnalogF64(task_handle, num_samples / read_segments, read_timeout,
-                                       pydaqmx.DAQmx_Val_GroupByScanNumber, segment_data, num_channels * num_samples,
-                                       read, None)
-            analog_data = numpy.append(analog_data, segment_data)
+            # Read from the Analog Input and append it to the analog data segment
+            pydaqmx.DAQmxReadAnalogF64(task_handle,
+                                       num_samples / read_segments,
+                                       read_timeout,
+                                       pydaqmx.DAQmx_Val_GroupByScanNumber,
+                                       segment_data,
+                                       num_channels * num_samples,
+                                       read,
+                                       None)
+            analog_segment = numpy.append(analog_segment, segment_data)
+
+            # Start a timer and continually read from the counter until the segment timer elapses
             start_counter = time.time()
             while time.time() - start_counter < segment_time:
                 curr_counter_data = inst.query("READ:FREQ?")
-                next_freq = float(curr_counter_data) * 1e-6
-                counter_data = numpy.append(counter_data, next_freq)
+                next_freq = float(curr_counter_data) * 1e-6     # Convert from Hz to MHz
+                counter_segment = numpy.append(counter_segment, next_freq)
 
-        # Save Analog In data to a file
+        # Combine all data and save it to a file
         f = open("data.npy", mode='wb+')
-        numpy.save(f, numpy.append(analog_data, counter_data))
+        numpy.save(f, numpy.append(numpy.append(header_segment, analog_segment), counter_segment))
         print "Data written to file"
 
-        print "{} points taken from counter ({} Hz)".format(len(counter_data),
-                                                            len(counter_data) / (num_samples / sample_rate_in_hz))
+        print "{} points taken from counter ({} Hz)".format(len(counter_segment),
+                                                            len(counter_segment) / (num_samples / sample_rate_in_hz))
 
+    # I'm not sure how helpful the exception messages are, as (surprisingly) I haven't encountered them yet.
     except pydaqmx.DAQError as err:
         print "DAQmx Error: %s" % err
     finally:
@@ -120,29 +142,39 @@ def initialize_frequency_counter_state(counter):
     counter.write(":INIT:CONT ON")
 
 
-def combine_raw_data(num_analog_samples):
+def combine_raw_data(file_name):
     """
-    Read data from the file below, assumed to be two interleaved channels from the analog input with the given total
-    length followed by all of the frequency counter readings assumed to be taken over the same time span.
+    Parse the data from the given file, reading from the array assuming the same data format convention noted in the
+    docstring for sample_data().  It reads the analog data and associates it with the given timebase in the data file
+    header, then assumes the frequency counter shares the same time base.  Then, assuming that the analog data is a
+    function y(t) and the counter data is x(t), combines them together in order to produce data of the form y(x)
 
-    :param num_analog_samples:  The total number of samples in the analog input
-    :return:
+    :param file_name:   Name of the file to read data from, assumed to be in the local directory.
+    :return:            x,y such that
     """
-    f = open("data1.npy", mode='rb+')
+    # Read all the data out and parse the header data
+    f = open(file_name, mode='rb+')
     all_data = numpy.load(f)
+    header_length = int(all_data[0])
+    samples_per_channel = int(all_data[1])
+    num_channels = int(all_data[3])
+    num_analog_samples = int(samples_per_channel * num_channels)
+    time_span = 1.0 * all_data[1] / all_data[2]
 
-    # Analog input data (index 2n+1 is spectroscopy signal)
-    analog_data = all_data[:num_analog_samples]
-    num_channels = 2
-    samples_per_channel = len(analog_data) / num_channels
-    x_analog = numpy.linspace(0, 1, samples_per_channel)
-    y_analog = [analog_data[num_channels * i + 1] for i in range(samples_per_channel)]
-    print "{} analog points ({} Hz)".format(len(x_analog), len(x_analog))
+    # Analog input data (index 1 is spectroscopy signal)
+    channel_index = 1
+    analog_data = all_data[header_length:(num_analog_samples + header_length)]
+    x_analog = numpy.linspace(0, time_span, samples_per_channel)
+    y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
+    print "Reading {} analog points".format(len(x_analog))
 
     # Frequency counter data
-    counter_data = all_data[num_analog_samples:]
-    x_counter = numpy.linspace(0, 1, len(counter_data))
-    print "{} counter points ({} Hz)".format(len(x_counter), len(x_counter))
+    counter_error_threshold = 1e10  # Reject data points with absolute value higher than this value
+    counter_data = all_data[(num_analog_samples + header_length):]
+    counter_data = [counter_data[i] for i in range(len(counter_data))
+                    if abs(counter_data[i]) < counter_error_threshold]
+    x_counter = numpy.linspace(0, time_span, len(counter_data))
+    print "{} counter points".format(len(x_counter))
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -171,6 +203,7 @@ def combine_raw_data(num_analog_samples):
         unfolded_counter_data[i] = counter_data[i] * (-1 if is_output_inverted else 1)
 
     # Combine the counter and analog data using linear interpolation from the counter data (analog_pts >> counter_pts)
+    '''
     x1c = x_counter[0]
     y1c = unfolded_counter_data[0]
     x2c = x_counter[1]
@@ -184,6 +217,17 @@ def combine_raw_data(num_analog_samples):
             x2c = x_counter[counter_index]
             y2c = unfolded_counter_data[counter_index]
         x_analog[i] = (x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c
+    '''
+
+    # Plot raw data
+    fig, ax1 = plt.subplots()
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Analog In (V)', color='r')
+    ax1.plot(x_analog, y_analog, color='r')
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Frequency Counter (MHz)', color='b')
+    ax2.plot(x_counter, counter_data, color='b')
+    plt.show()
 
     return x_analog, y_analog
 
@@ -298,7 +342,7 @@ def process_data(x_raw, y_raw):
 
     # Plotting code to show processed data for visual checking
     plt.scatter(x4, y4, s=0.5)
-    plt.xlabel('Ramp Voltage (V)')
+    plt.xlabel('Beat Frequency (MHz)')
     plt.ylabel('Preamp Output (V)')
     plt.show()
 
@@ -346,12 +390,13 @@ def read_rs232():
 
 
 # Read data from the analog in
-numSamples = 500000
+data_time = 50
+sampleRateInHz = 10000
 numChannels = 2
-sampleRateInHz = 100000.0
-# sample_data(numSamples, sampleRateInHz, numChannels)
-freq, signal = combine_raw_data(numSamples * numChannels)
-process_data(freq, signal)
+numSamples = data_time * sampleRateInHz
+# sample_data(numSamples, sampleRateInHz, numChannels, "data.npy")
+freq, signal = combine_raw_data("data.npy")
+# process_data(freq, signal)
 # transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
 # saturated_absorption_signal(transitions, 10)
 # read_rs232()
