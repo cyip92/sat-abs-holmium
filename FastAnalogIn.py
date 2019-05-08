@@ -120,7 +120,14 @@ def initialize_frequency_counter_state(counter):
     counter.write(":INIT:CONT ON")
 
 
-def plot_raw_data(num_analog_samples, time_span):
+def combine_raw_data(num_analog_samples):
+    """
+    Read data from the file below, assumed to be two interleaved channels from the analog input with the given total
+    length followed by all of the frequency counter readings assumed to be taken over the same time span.
+
+    :param num_analog_samples:  The total number of samples in the analog input
+    :return:
+    """
     f = open("data1.npy", mode='rb+')
     all_data = numpy.load(f)
 
@@ -128,14 +135,14 @@ def plot_raw_data(num_analog_samples, time_span):
     analog_data = all_data[:num_analog_samples]
     num_channels = 2
     samples_per_channel = len(analog_data) / num_channels
-    x_analog = numpy.linspace(0, time_span, samples_per_channel)
-    y1 = [analog_data[num_channels * i + 1] for i in range(samples_per_channel)]
-    print "{} analog points ({} Hz)".format(len(x_analog), len(x_analog) / time_span)
+    x_analog = numpy.linspace(0, 1, samples_per_channel)
+    y_analog = [analog_data[num_channels * i + 1] for i in range(samples_per_channel)]
+    print "{} analog points ({} Hz)".format(len(x_analog), len(x_analog))
 
     # Frequency counter data
     counter_data = all_data[num_analog_samples:]
-    x_counter = numpy.linspace(0, time_span, len(counter_data))
-    print "{} counter points ({} Hz)".format(len(x_counter), len(x_counter) / time_span)
+    x_counter = numpy.linspace(0, 1, len(counter_data))
+    print "{} counter points ({} Hz)".format(len(x_counter), len(x_counter))
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -163,18 +170,25 @@ def plot_raw_data(num_analog_samples, time_span):
                     unfolded_counter_data[i - j] *= -1
         unfolded_counter_data[i] = counter_data[i] * (-1 if is_output_inverted else 1)
 
-    # Plot both on the same plot
-    fig, ax1 = plt.subplots()
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Analog In (V)', color='r')
-    ax1.plot(x_analog, y1, color='r')
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Frequency Counter (MHz)', color='b')
-    ax2.plot(x_counter, unfolded_counter_data, color='b')
-    plt.show()
+    # Combine the counter and analog data using linear interpolation from the counter data (analog_pts >> counter_pts)
+    x1c = x_counter[0]
+    y1c = unfolded_counter_data[0]
+    x2c = x_counter[1]
+    y2c = unfolded_counter_data[1]
+    counter_index = 1
+    for i in range(len(x_analog)):
+        if x_analog[i] > x2c:
+            counter_index += 1
+            x1c = x2c
+            y1c = y2c
+            x2c = x_counter[counter_index]
+            y2c = unfolded_counter_data[counter_index]
+        x_analog[i] = (x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c
+
+    return x_analog, y_analog
 
 
-def process_data():
+def process_data(x_raw, y_raw):
     """
     Filter out invalid segments of data based on certain patterns and average together what is left.  The particular
     filtering processes are due to some unstable experimental artifacts specific to the holmium setup and may not be
@@ -182,12 +196,6 @@ def process_data():
 
     :return: A list of (x,y) tuples containing the averaged data
     """
-    # Read the raw data and split it into x/y arrays
-    f = open("data.npy", mode='rb+')
-    data = numpy.load(f)
-    data_series = numpy.split(data, 2)
-    x_raw = data_series[0]
-    y_raw = data_series[1]
 
     """
     Due to a delay between the saturated absorption signal and the voltage ramp, there is a hysteresis effect that
@@ -342,8 +350,8 @@ numSamples = 500000
 numChannels = 2
 sampleRateInHz = 100000.0
 # sample_data(numSamples, sampleRateInHz, numChannels)
-plot_raw_data(numSamples * numChannels, numSamples / sampleRateInHz)
-# process_data()
+freq, signal = combine_raw_data(numSamples * numChannels)
+process_data(freq, signal)
 # transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
 # saturated_absorption_signal(transitions, 10)
 # read_rs232()
