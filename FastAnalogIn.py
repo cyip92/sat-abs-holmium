@@ -33,7 +33,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
     analog_in_location = "Dev1/ai0:1"
     task_handle = pydaqmx.TaskHandle()
     read = ctypes.c_long(0)
-    read_segments = 100
+    read_segments = 500
     header_segment = numpy.array([4, num_samples, sample_rate_in_hz, num_channels])
     segment_data = numpy.zeros((num_channels * num_samples / read_segments,), dtype=numpy.float64)
     analog_segment = numpy.zeros((0,), dtype=numpy.float64)
@@ -78,7 +78,9 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
         segment_time = 1.0 * num_samples / sample_rate_in_hz / read_segments
         print "Reading data, split into {} segments each {} seconds long".format(read_segments, segment_time)
         counter_segment = numpy.zeros((0,), dtype=numpy.float64)
+        start_time = time.time()
         for segment in range(read_segments):
+            start_time += segment_time
             # Read from the Analog Input and append it to the analog data segment
             pydaqmx.DAQmxReadAnalogF64(task_handle,
                                        num_samples / read_segments,
@@ -90,15 +92,20 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
                                        None)
             analog_segment = numpy.append(analog_segment, segment_data)
 
-            # Start a timer and continually read from the counter until the segment timer elapses
-            start_counter = time.time()
-            while time.time() - start_counter < segment_time:
-                curr_counter_data = inst.query("READ:FREQ?")
-                next_freq = float(curr_counter_data) * 1e-6     # Convert from Hz to MHz
-                counter_segment = numpy.append(counter_segment, next_freq)
+            # Continually read from the counter until the segment timer elapses
+            while time.time() - start_time < segment_time:
+                has_data = False
+                total_time = 0.02
+                meas_start = time.time()
+                while time.time() - meas_start < total_time:
+                    if not has_data:
+                        curr_counter_data = inst.query("READ:FREQ?")
+                        next_freq = float(curr_counter_data) * 1e-6     # Convert from Hz to MHz
+                        counter_segment = numpy.append(counter_segment, next_freq)
+                        has_data = True
 
         # Combine all data and save it to a file
-        f = open("data.npy", mode='wb+')
+        f = open(file_name, mode='wb+')
         numpy.save(f, numpy.append(numpy.append(header_segment, analog_segment), counter_segment))
         print "Data written to file"
 
@@ -162,19 +169,42 @@ def combine_raw_data(file_name):
     time_span = 1.0 * all_data[1] / all_data[2]
 
     # Analog input data (index 1 is spectroscopy signal)
-    channel_index = 1
+    channel_index = 0
     analog_data = all_data[header_length:(num_analog_samples + header_length)]
     x_analog = numpy.linspace(0, time_span, samples_per_channel)
     y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
     print "Reading {} analog points".format(len(x_analog))
 
-    # Frequency counter data
-    counter_error_threshold = 1e10  # Reject data points with absolute value higher than this value
-    counter_data = all_data[(num_analog_samples + header_length):]
-    counter_data = [counter_data[i] for i in range(len(counter_data))
-                    if abs(counter_data[i]) < counter_error_threshold]
-    x_counter = numpy.linspace(0, time_span, len(counter_data))
-    print "{} counter points".format(len(x_counter))
+    """
+    Parse the frequency counter data with some invalid data rejection.  First, sample the first sample_window gaps
+    between successive data points and set a gap threshold such that any adjacent data points separated by more than
+    1.5 times the median of these sample gaps are marked as invalid points.
+    
+    There is also an additional error_threshold value which will also reject data whose absolute values is higher than
+    what is given.  The original purpose of this was to reject error readings which by default read something very
+    around 9e32.  It can instead be used to reject clearly bogus readings such as those well outside of the counter's
+    250 MHz limit.
+    """
+    raw_counter_data = all_data[(num_analog_samples + header_length):]
+    sample_window = 40
+    sample_gaps = [abs(raw_counter_data[i + 1] - raw_counter_data[i]) for i in range(sample_window)]
+    sample_gaps.sort()
+    gap_threshold = 1.5 * sample_gaps[sample_window / 2]
+    error_threshold = 350
+    x_counter_raw = numpy.linspace(0, time_span, len(raw_counter_data))
+    valid_index = []
+    for i in range(len(raw_counter_data) - 2):
+        if (abs(raw_counter_data[i + 1] - raw_counter_data[i]) < gap_threshold
+                and abs(raw_counter_data[i + 2] - raw_counter_data[i]) < 2 * gap_threshold
+                and abs(raw_counter_data[i]) < error_threshold):
+            valid_index.extend([True])
+        else:
+            valid_index.extend([False])
+    valid_index.extend([False])
+    valid_index.extend([False])
+    x_counter = [x_counter_raw[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
+    y_counter = [raw_counter_data[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
+    print "{} counter points, filtered to {}".format(len(raw_counter_data), len(y_counter))
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -186,38 +216,48 @@ def combine_raw_data(file_name):
     """
     is_output_inverted = False
     index_margin = 10
-    zero_margin = 50
-    data_slope_increasing = counter_data[index_margin] - counter_data[0] > 0
-    unfolded_counter_data = numpy.zeros((len(counter_data),), dtype=numpy.float64)
+    data_slope_increasing = y_counter[index_margin] - y_counter[0] > 0
+    unfolded_counter_data = numpy.zeros((len(y_counter),), dtype=numpy.float64)
     for i in range(index_margin):
-        unfolded_counter_data[i] = counter_data[i]
-    for i in range(index_margin, len(counter_data)):
-        curr_data_slope_increasing = counter_data[i] - counter_data[i - index_margin] > 0
+        unfolded_counter_data[i] = y_counter[i]
+    for i in range(index_margin, len(y_counter)):
+        curr_data_slope_increasing = y_counter[i] - y_counter[i - index_margin] > 0
         if curr_data_slope_increasing != data_slope_increasing:
             if not data_slope_increasing:
                 is_output_inverted = not is_output_inverted
             data_slope_increasing = curr_data_slope_increasing
-            if abs(counter_data[i]) < zero_margin:
-                for j in range(index_margin / 2 + 1):
-                    unfolded_counter_data[i - j] *= -1
-        unfolded_counter_data[i] = counter_data[i] * (-1 if is_output_inverted else 1)
+        unfolded_counter_data[i] = y_counter[i] * (-1 if is_output_inverted else 1)
+    # Go back through and invert any points missed near the turning points
+    '''y_counter = unfolded_counter_data
+    zero_margin = 50
+    for i in range(index_margin, len(x_counter)):
+        if abs(y_counter[i]) < zero_margin:
+            slope = y_counter[i - 1] - y_counter[i - 3]
+            estimate = y_counter[i - 1] + slope / 2.0
+            if abs(-y_counter[i] - estimate) < abs(y_counter[i] - estimate):
+                y_counter[i] *= -1'''
 
     # Combine the counter and analog data using linear interpolation from the counter data (analog_pts >> counter_pts)
-    '''
     x1c = x_counter[0]
     y1c = unfolded_counter_data[0]
     x2c = x_counter[1]
     y2c = unfolded_counter_data[1]
     counter_index = 1
+    x_combined = []
+    y_combined = []
     for i in range(len(x_analog)):
         if x_analog[i] > x2c:
             counter_index += 1
+            if counter_index == len(x_counter):
+                break
             x1c = x2c
             y1c = y2c
             x2c = x_counter[counter_index]
-            y2c = unfolded_counter_data[counter_index]
-        x_analog[i] = (x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c
-    '''
+            y2c = y_counter[counter_index]
+        if valid_index[counter_index - 1] and valid_index[counter_index]:
+            x_combined.extend([(x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c])
+            y_combined.extend([y_analog[i]])
+
 
     # Plot raw data
     fig, ax1 = plt.subplots()
@@ -226,10 +266,17 @@ def combine_raw_data(file_name):
     ax1.plot(x_analog, y_analog, color='r')
     ax2 = ax1.twinx()
     ax2.set_ylabel('Frequency Counter (MHz)', color='b')
-    ax2.plot(x_counter, counter_data, color='b')
+    ax2.plot(x_counter, y_counter, color='b')
     plt.show()
 
-    return x_analog, y_analog
+    '''
+    plt.scatter(x_combined, y_combined, s=0.5)
+    plt.xlabel('Beat Frequency (MHz)')
+    plt.ylabel('Preamp Output (V)')
+    plt.show()
+    '''
+
+    return x_combined, y_combined
 
 
 def process_data(x_raw, y_raw):
@@ -390,12 +437,12 @@ def read_rs232():
 
 
 # Read data from the analog in
-data_time = 50
+data_time = 120
 sampleRateInHz = 10000
 numChannels = 2
 numSamples = data_time * sampleRateInHz
-# sample_data(numSamples, sampleRateInHz, numChannels, "data.npy")
-freq, signal = combine_raw_data("data.npy")
+sample_data(numSamples, sampleRateInHz, numChannels, "phase_test.npy")
+freq, signal = combine_raw_data("phase_test.npy")
 # process_data(freq, signal)
 # transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
 # saturated_absorption_signal(transitions, 10)
