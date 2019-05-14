@@ -541,7 +541,7 @@ def get_fitting_error(measured_freq, Ae, Be):
     transition_locations.sort()
     adjusted = adjust_offset_to_minimize_error(measured_freq, transition_locations)
     diff = get_nearest_differences(measured_freq, adjusted)
-    return sum(x*x for x in diff)
+    return pow(sum(x*x for x in diff) / len(measured_freq), 0.5)
 
 
 def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points):
@@ -568,6 +568,7 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
     fig, ax = plt.subplots()
     CS = ax.contour(x, y, mean_sq_error)
     ax.clabel(CS, inline=1, fontsize=10)
+    ax.set_title("sqrt(Mean Squared Error)")
     plt.xlabel("A")
     plt.ylabel("B")
     plt.show()
@@ -583,20 +584,28 @@ numSamples = data_time * sampleRateInHz
 # process_data(freq, signal)
 
 data_freq = [-221.3, -216.0, -128.5, 4.1, 92.9, 131.5, 217.7, 217.7]
+data_uncertainty = [3.5, 4.9, 5.9, 2.8, 3.4, 3.6, 4.4, 4.4]
 measured_freq = [-2*f for f in data_freq]
+measured_uncertainty = [2*f for f in data_uncertainty]
 # generate_contour_plot(measured_freq, 728.2, 729.3, 870, 930, 100)
-A_range = (715.8, 716.0)
-B_range = (995, 1015)
+A_range = (715.8-0.7, 716.0+0.7)
+B_range = (997-64, 1017+64)
 # generate_contour_plot(measured_freq, A_range[0], A_range[1], B_range[0], B_range[1], 20)
 
-A_fitted = (A_range[0] + A_range[1]) / 2 * 0 + 715.9
-B_fitted = (B_range[0] + B_range[1]) / 2 * 0 + 867.0
+A_fitted = (A_range[0] + A_range[1]) / 2
+B_fitted = (B_range[0] + B_range[1]) / 2
+print "Plotting with A={} and B={}".format(A_fitted, B_fitted)
 calc_transitions = get_peak_locations(A_fitted, B_fitted)
 calc_transitions.sort()
-print measured_freq
 adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
+measured_freq.sort()
+print measured_freq
 print adjusted
+chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
+print chi2
+'''
 shift = calc_transitions[0] - adjusted[0]
 fitted_transitions = get_peak_locations_and_heights(A_fitted, B_fitted, shift, 1)
 print fitted_transitions
 saturated_absorption_signal(fitted_transitions, 15, measured_freq)
+'''
