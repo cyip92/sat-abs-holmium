@@ -6,7 +6,6 @@ from operator import itemgetter
 from tqdm import tqdm
 import Queue
 from sympy.physics.wigner import wigner_6j
-import serial
 import pyvisa as visa
 import time
 
@@ -33,7 +32,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
     analog_in_location = "Dev1/ai0:1"
     task_handle = pydaqmx.TaskHandle()
     read = ctypes.c_long(0)
-    read_segments = 500
+    read_segments = 50
     header_segment = numpy.array([4, num_samples, sample_rate_in_hz, num_channels])
     segment_data = numpy.zeros((num_channels * num_samples / read_segments,), dtype=numpy.float64)
     analog_segment = numpy.zeros((0,), dtype=numpy.float64)
@@ -169,7 +168,7 @@ def combine_raw_data(file_name):
     time_span = 1.0 * all_data[1] / all_data[2]
 
     # Analog input data (index 1 is spectroscopy signal)
-    channel_index = 0
+    channel_index = 1
     analog_data = all_data[header_length:(num_analog_samples + header_length)]
     x_analog = numpy.linspace(0, time_span, samples_per_channel)
     y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
@@ -205,6 +204,12 @@ def combine_raw_data(file_name):
     x_counter = [x_counter_raw[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
     y_counter = [raw_counter_data[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
     print "{} counter points, filtered to {}".format(len(raw_counter_data), len(y_counter))
+
+    # Print average frequency and standard deviation
+    avg_freq = sum(raw_counter_data) / len(raw_counter_data)
+    variances = [pow(raw_counter_data[i] - avg_freq, 2) for i in range(len(raw_counter_data))]
+    stdev = pow(sum(variances) / len(raw_counter_data), 0.5)
+    print "Avg. frequency {}, stdev {}".format(sum(raw_counter_data) / len(raw_counter_data), stdev)
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -396,14 +401,25 @@ def process_data(x_raw, y_raw):
     return [(x3[i], y3[i]) for i in range(len(x3))]
 
 
-def saturated_absorption_peaks(Ae, Be, x_scale, x_offset, y_scale):
-    # Atomic structure parameters (exact spin values, assumed ground state hyperfine)
-    I = 7 / 2.
-    Jg = 15 / 2.
-    Je = 17 / 2.
-    Ag = 800.58
-    Bg = -1668
+# Atomic structure parameters (exact spin values, assumed ground state hyperfine)
+I = 7 / 2.
+Jg = 15 / 2.
+Je = 17 / 2.
+Ag = 800.58
+Bg = -1668
 
+
+def get_peak_locations_and_heights(Ae, Be, x_offset, y_scale):
+    """
+    Returns a list of tuples (peak_freq, peak_height) corresponding to locations and relative heights of peaks in the
+    saturated absorption spectrum, given the excited state hyperfine constants as input parameters.
+
+    :param Ae:          Excited state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Be:          Excited state B hyperfine coefficient in MHz (electric quadrupole)
+    :param x_offset:    Shift to apply to all peaks in order to appropriately fit the data
+    :param y_scale:     Multiplicative factor to apply to all peak heights
+    :return:            List of tuples (peak_location, peak_height)
+    """
     transitions = []
     for Fg in range(4, 12):
         Fe = Fg + 1
@@ -412,38 +428,175 @@ def saturated_absorption_peaks(Ae, Be, x_scale, x_offset, y_scale):
         Ug = Ag*Kg / 2 + Bg * (3/2.*Kg*(Kg+1) - 2*I*(I+1)*Jg*(Jg+1)) / (4*I*(2*I-1)*Jg*(2*Jg-1))
         Ue = Ae*Ke / 2 + Be * (3/2.*Ke*(Ke+1) - 2*I*(I+1)*Je*(Je+1)) / (4*I*(2*I-1)*Je*(2*Je-1))
         peak_height = pow(wigner_6j(Jg, I, Fg, Fe, 1, Je), 2) * ((2*Fg + 1) * (2*Fe + 1))
-        transitions.append((x_scale * (Ue - Ug - x_offset), peak_height * y_scale))
+        transitions.append((Ue - Ug - x_offset, peak_height * y_scale))
     return transitions
 
 
-def saturated_absorption_signal(transitions, linewidth):
+def get_peak_locations(Ae, Be):
+    """
+    Returns a list of floats corresponding to locations of peaks in the saturated absorption spectrum, given the excited
+    state hyperfine constants as input parameters.  Note that this doesn't return peak heights.
+
+    :param Ae:          Excited state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Be:          Excited state B hyperfine coefficient in MHz (electric quadrupole)
+    :return:            List of floats
+    """
+    transitions = []
+    for Fg in range(4, 12):
+        Fe = Fg + 1
+        Kg = Fg * (Fg + 1) - I * (I + 1) - Jg * (Jg + 1)
+        Ke = Fe * (Fe + 1) - I * (I + 1) - Je * (Je + 1)
+        Ug = Ag * Kg / 2 + Bg * (3 / 2. * Kg * (Kg + 1) - 2 * I * (I + 1) * Jg * (Jg + 1)) / (
+                    4 * I * (2 * I - 1) * Jg * (2 * Jg - 1))
+        Ue = Ae * Ke / 2 + Be * (3 / 2. * Ke * (Ke + 1) - 2 * I * (I + 1) * Je * (Je + 1)) / (
+                    4 * I * (2 * I - 1) * Je * (2 * Je - 1))
+        transitions.append(Ue - Ug)
+    return transitions
+
+
+def saturated_absorption_signal(transitions, linewidth, v_lines):
+    """
+    Produces a plot showing the saturated absorption signal, given a transition list from
+    get_peak_locations_and_heights().
+
+    :param transitions:     Transition list from get_peak_locations_and_heights()
+    :param linewidth:       Linewidth of the main transition in MHz, scaled by the factors in the transition list for
+        each individual peak
+    :return:                None; produces a plot instead
+    """
     low_x = min([a[0] for a in transitions]) - 5*linewidth
     high_x = max([a[0] for a in transitions]) + 5*linewidth
     x = numpy.linspace(low_x, high_x, 2000)
     y = [sum([transitions[j][1] / (1 + pow((x[i] - transitions[j][0]) / linewidth, 2))
               for j in range(len(transitions))]) for i in range(len(x))]
 
+    for f in v_lines:
+        plt.axvline(x=f)
     plt.scatter(x, y, s=0.5)
     plt.xlabel('Detuning (MHz)')
     plt.ylabel('Absorption Signal (arb.)')
     plt.show()
 
 
-def read_rs232():
-    ser = serial.Serial(port='COM4', baudrate=9600, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
-                        stopbits=serial.STOPBITS_ONE, timeout=10)
-    while ser.inWaiting():
-        print float(ser.readline().split(' ')[0])
+def get_nearest_differences(measured, calculated):
+    """
+    Returns the a list of values corresponding to the absolute difference between each value in measured and the nearest
+    value in calculated to that value.
+
+    :param measured:    List of measured values to get differences for
+    :param calculated:  List of reference values to compare against
+    :return:
+    """
+    meas = measured
+    calc = calculated
+    meas.sort()
+    calc.sort()
+    return [abs(meas[i] - calc[i]) for i in range(len(meas))]
+
+
+def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
+    """
+    Adjusts the calculated frequencies with an offset in order to find a shifted frequency set that minimizes the
+    mean-squared error between each measured peak and its corresponding nearest calculated peak.
+
+    :param freq_measured:       List of measured peaks
+    :param freq_calculated:     List of calculated peaks (assumed to be sorted)
+    """
+    # In order to get a decent first approxmiation, shift the calculated list so both have the same center
+    center_measured = (min(freq_measured) + max(freq_measured)) / 2
+    center_calculated = (min(freq_calculated) + max(freq_calculated)) / 2
+    freq_calculated = [x - (center_calculated - center_measured) for x in freq_calculated]
+
+    applied_offset = 0
+    offset_step = 10
+    num_steps = 200
+    while offset_step > 0.001:
+        best_offset = 0
+        best_error_metric = 1e100
+        for i in range(- num_steps / 2, num_steps / 2):
+            curr_offset = applied_offset + i * offset_step
+            freq_shifted = [x + curr_offset for x in freq_calculated]
+            errors = get_nearest_differences(freq_measured, freq_shifted)
+            mean_sq_error = sum(x*x for x in errors) / len(freq_measured)
+            # print "offset {}, error {}".format(curr_offset, mean_sq_error)
+            if mean_sq_error < best_error_metric:
+                best_error_metric = mean_sq_error
+                best_offset = curr_offset
+        offset_step /= 3.0
+        applied_offset = best_offset
+    return [x + applied_offset for x in freq_calculated]
+
+
+def get_fitting_error(measured_freq, Ae, Be):
+    """
+    Returns mean-squared errors for an optimally-shifted set of calculated frequencies from the given hyperfine
+    coefficients.
+
+    :param measured_freq:   List of measured frequencies, in MHz
+    :param Ae:              Excited state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Be:              Excited state B hyperfine coefficient in MHz (electric quadrupole)
+    :return:                Total mean-squared fitting error
+    """
+    transition_locations = get_peak_locations(Ae, Be)
+    transition_locations.sort()
+    adjusted = adjust_offset_to_minimize_error(measured_freq, transition_locations)
+    diff = get_nearest_differences(measured_freq, adjusted)
+    return sum(x*x for x in diff)
+
+
+def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points):
+    """
+    Generates a coutour plot of the optimized mean-squared error between the measured spectrum and a spectrum generated
+    from hyperfine constants within the ranges defined by the parameters.
+
+    :param measured_freq:   List of peaks
+    :param A_min:           Lower bound of hyperfine constant A (MHz)
+    :param A_max:           Upper bound of hyperfine constant A (MHz)
+    :param B_min:           Lower bound of hyperfine constant B (MHz)
+    :param B_max:           Upper bound of hyperfine constant B (MHz)
+    :param grid_points:     Number of points to divide each axis into - note that total time to generate the contour
+        plot scales as this argument squared
+    :return:                None
+    """
+    hyperfine_A = numpy.linspace(A_min, A_max, grid_points)
+    hyperfine_B = numpy.linspace(B_min, B_max, grid_points)
+    x, y = numpy.meshgrid(hyperfine_A, hyperfine_B)
+    mean_sq_error = numpy.zeros((len(hyperfine_A), len(hyperfine_B)))
+    for i in tqdm(range(grid_points), ascii=True):
+        for j in range(grid_points):
+            mean_sq_error[i][j] = get_fitting_error(measured_freq, x[i][j], y[i][j])
+    fig, ax = plt.subplots()
+    CS = ax.contour(x, y, mean_sq_error)
+    ax.clabel(CS, inline=1, fontsize=10)
+    plt.xlabel("A")
+    plt.ylabel("B")
+    plt.show()
 
 
 # Read data from the analog in
-data_time = 120
+data_time = 20
 sampleRateInHz = 10000
 numChannels = 2
 numSamples = data_time * sampleRateInHz
-sample_data(numSamples, sampleRateInHz, numChannels, "phase_test.npy")
-freq, signal = combine_raw_data("phase_test.npy")
+# sample_data(numSamples, sampleRateInHz, numChannels, "long_sweep.npy")
+# freq, signal = combine_raw_data("long_sweep.npy")
 # process_data(freq, signal)
-# transitions = saturated_absorption_peaks(715.8, 920, -1, 1000, 1)
-# saturated_absorption_signal(transitions, 10)
-# read_rs232()
+
+data_freq = [-221.3, -216.0, -128.5, 4.1, 92.9, 131.5, 217.7, 217.7]
+measured_freq = [-2*f for f in data_freq]
+# generate_contour_plot(measured_freq, 728.2, 729.3, 870, 930, 100)
+A_range = (715.8, 716.0)
+B_range = (995, 1015)
+# generate_contour_plot(measured_freq, A_range[0], A_range[1], B_range[0], B_range[1], 20)
+
+A_fitted = (A_range[0] + A_range[1]) / 2 * 0 + 715.9
+B_fitted = (B_range[0] + B_range[1]) / 2 * 0 + 867.0
+calc_transitions = get_peak_locations(A_fitted, B_fitted)
+calc_transitions.sort()
+print measured_freq
+adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
+print adjusted
+shift = calc_transitions[0] - adjusted[0]
+fitted_transitions = get_peak_locations_and_heights(A_fitted, B_fitted, shift, 1)
+print fitted_transitions
+saturated_absorption_signal(fitted_transitions, 15, measured_freq)
