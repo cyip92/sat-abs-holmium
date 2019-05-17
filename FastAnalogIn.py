@@ -174,6 +174,13 @@ def combine_raw_data(file_name):
     y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
     print "Reading {} analog points".format(len(x_analog))
 
+    # Voltage ramp data (index 0)
+    channel_index = 0
+    ramp_data = all_data[header_length:(num_analog_samples + header_length)]
+    x_ramp = numpy.linspace(0, time_span, samples_per_channel)
+    y_ramp = [ramp_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
+    print "Reading {} analog points".format(len(x_analog))
+
     """
     Parse the frequency counter data with some invalid data rejection.  First, sample the first sample_window gaps
     between successive data points and set a gap threshold such that any adjacent data points separated by more than
@@ -242,11 +249,12 @@ def combine_raw_data(file_name):
             if abs(-y_counter[i] - estimate) < abs(y_counter[i] - estimate):
                 y_counter[i] *= -1'''
 
+    '''
     # Combine the counter and analog data using linear interpolation from the counter data (analog_pts >> counter_pts)
-    x1c = x_counter[0]
-    y1c = unfolded_counter_data[0]
-    x2c = x_counter[1]
-    y2c = unfolded_counter_data[1]
+    x1c = x_ramp[0]
+    y1c = y_ramp[0]
+    x2c = x_ramp[1]
+    y2c = y_ramp[1]
     counter_index = 1
     x_combined = []
     y_combined = []
@@ -262,19 +270,27 @@ def combine_raw_data(file_name):
         if valid_index[counter_index - 1] and valid_index[counter_index]:
             x_combined.extend([(x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c])
             y_combined.extend([y_analog[i]])
+    '''
+
+    # Combine ramp and spectroscopy data
+    x_combined = []
+    y_combined = []
+    for i in tqdm(range(len(x_ramp)), ascii=True):
+        x_combined.extend([y_ramp[i]])
+        y_combined.extend([y_analog[i]])
 
 
     # Plot raw data
+    '''
     fig, ax1 = plt.subplots()
     ax1.set_xlabel('Time (s)')
     ax1.set_ylabel('Analog In (V)', color='r')
     ax1.plot(x_analog, y_analog, color='r')
-    ax2 = ax1.twinx()
-    ax2.set_ylabel('Frequency Counter (MHz)', color='b')
-    ax2.plot(x_counter, y_counter, color='b')
+    # ax2 = ax1.twinx()
+    # ax2.set_ylabel('Frequency Counter (MHz)', color='b')
+    # ax2.plot(x_counter, y_counter, color='b')
     plt.show()
 
-    '''
     plt.scatter(x_combined, y_combined, s=0.5)
     plt.xlabel('Beat Frequency (MHz)')
     plt.ylabel('Preamp Output (V)')
@@ -284,7 +300,24 @@ def combine_raw_data(file_name):
     return x_combined, y_combined
 
 
-def process_data(x_raw, y_raw):
+def read_spectroscopy_data(file_name, start_index, end_index):
+    """
+    Temporary function for reading out raw spectroscopy data.  Assumes all x values followed by all y values.
+
+    :param file_name:   Name of the file to read data from, assumed to be in the local directory.
+    """
+    # Read all the data out
+    f = open(file_name, mode='rb+')
+    all_data = numpy.load(f)
+    x_analog = all_data[:len(all_data) / 2]
+    y_analog = all_data[len(all_data) / 2:]
+    x_analog = x_analog[start_index: end_index]
+    y_analog = y_analog[start_index: end_index]
+
+    return x_analog, y_analog
+
+
+def process_data(x_raw, y_raw, file_name):
     """
     Filter out invalid segments of data based on certain patterns and average together what is left.  The particular
     filtering processes are due to some unstable experimental artifacts specific to the holmium setup and may not be
@@ -302,7 +335,7 @@ def process_data(x_raw, y_raw):
     ramp slope is positive.  The ramp_jaggedness variable allows for some tolerance due to the ramp voltage not being
     strictly increasing at all points.
     """
-    ramp_jaggedness = 10
+    ramp_jaggedness = 5
     ascending_ramp_indices = [i for i in range(len(x_raw) - ramp_jaggedness) if x_raw[i] < x_raw[i + ramp_jaggedness]]
     x1 = [x_raw[i] for i in ascending_ramp_indices]
     y1 = [y_raw[i] for i in ascending_ramp_indices]
@@ -398,6 +431,12 @@ def process_data(x_raw, y_raw):
     plt.ylabel('Preamp Output (V)')
     plt.show()
 
+    # Append both data sets together and save to a file.  Further processing should assume x and y of equal lengths due
+    # to the data formatting, which is a list of (x,y) points
+    f = open(file_name, mode='wb+')
+    numpy.save(f, numpy.append(x4, y4))
+    print 'Data saved to file "{}"'.format(file_name)
+
     return [(x3[i], y3[i]) for i in range(len(x3))]
 
 
@@ -405,8 +444,8 @@ def process_data(x_raw, y_raw):
 I = 7 / 2.
 Jg = 15 / 2.
 Je = 17 / 2.
-Ag = 800.58
-Bg = -1668
+Ag = 800.583645
+Bg = -1668.00527
 
 
 def get_peak_locations_and_heights(Ae, Be, x_offset, y_scale):
@@ -454,7 +493,7 @@ def get_peak_locations(Ae, Be):
     return transitions
 
 
-def saturated_absorption_signal(transitions, linewidth, v_lines):
+def saturated_absorption_signal(transitions, linewidth, v_lines, x_other=None, y_other=None):
     """
     Produces a plot showing the saturated absorption signal, given a transition list from
     get_peak_locations_and_heights().
@@ -466,13 +505,14 @@ def saturated_absorption_signal(transitions, linewidth, v_lines):
     """
     low_x = min([a[0] for a in transitions]) - 5*linewidth
     high_x = max([a[0] for a in transitions]) + 5*linewidth
-    x = numpy.linspace(low_x, high_x, 2000)
+    x = numpy.linspace(low_x, high_x, 1000)
     y = [sum([transitions[j][1] / (1 + pow((x[i] - transitions[j][0]) / linewidth, 2))
               for j in range(len(transitions))]) for i in range(len(x))]
 
     for f in v_lines:
         plt.axvline(x=f)
-    plt.scatter(x, y, s=0.5)
+    plt.scatter(x_other, y_other, s=0.5, color='k')
+    plt.scatter(x, y, s=2, color='r')
     plt.xlabel('Detuning (MHz)')
     plt.ylabel('Absorption Signal (arb.)')
     plt.show()
@@ -575,13 +615,17 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
 
 
 # Read data from the analog in
-data_time = 20
-sampleRateInHz = 10000
+data_time = 10
+sampleRateInHz = 500000
 numChannels = 2
 numSamples = data_time * sampleRateInHz
-# sample_data(numSamples, sampleRateInHz, numChannels, "long_sweep.npy")
-# freq, signal = combine_raw_data("long_sweep.npy")
-# process_data(freq, signal)
+# sample_data(numSamples, sampleRateInHz, numChannels, "fast_sweeps2.npy")
+# freq, signal = combine_raw_data("fast_sweeps2.npy")
+# process_data(freq, signal, "combined_sweeps.npy")
+
+x_plot, plot_data = read_spectroscopy_data("combined_sweeps.npy", 8.7e5, 17.4e5)
+x_plot = numpy.linspace(500, -500, len(plot_data))
+plot_data = [10.5*val+0.25 for val in plot_data]
 
 data_freq = [-221.3, -216.0, -128.5, 4.1, 92.9, 131.5, 217.7, 217.7]
 data_uncertainty = [3.5, 4.9, 5.9, 2.8, 3.4, 3.6, 4.4, 4.4]
@@ -599,6 +643,7 @@ calc_transitions = get_peak_locations(A_fitted, B_fitted)
 calc_transitions.sort()
 adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
 measured_freq.sort()
+'''
 print measured_freq
 print adjusted
 chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
@@ -607,5 +652,5 @@ print chi2
 shift = calc_transitions[0] - adjusted[0]
 fitted_transitions = get_peak_locations_and_heights(A_fitted, B_fitted, shift, 1)
 print fitted_transitions
-saturated_absorption_signal(fitted_transitions, 15, measured_freq)
-'''
+saturated_absorption_signal(fitted_transitions, 17, measured_freq, x_other=x_plot, y_other=plot_data)
+
