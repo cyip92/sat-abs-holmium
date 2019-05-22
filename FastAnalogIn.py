@@ -216,7 +216,12 @@ def combine_raw_data(file_name):
     avg_freq = sum(raw_counter_data) / len(raw_counter_data)
     variances = [pow(raw_counter_data[i] - avg_freq, 2) for i in range(len(raw_counter_data))]
     stdev = pow(sum(variances) / len(raw_counter_data), 0.5)
-    print "Avg. frequency {}, stdev {}".format(sum(raw_counter_data) / len(raw_counter_data), stdev)
+    print "Avg. frequency {}, stdev {}, range ({}, {})".format(sum(raw_counter_data) / len(raw_counter_data), stdev,
+                                                               min(raw_counter_data), max(raw_counter_data))
+    plt.hist(raw_counter_data)
+    plt.xlabel("Frequency Measurement")
+    plt.ylabel("Occurrences")
+    plt.show()
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -444,11 +449,9 @@ def process_data(x_raw, y_raw, file_name):
 I = 7 / 2.
 Jg = 15 / 2.
 Je = 17 / 2.
-Ag = 800.583645
-Bg = -1668.00527
 
 
-def get_peak_locations_and_heights(Ae, Be, x_offset, y_scale):
+def get_peak_locations_and_heights(Ag, Bg, Ae, Be, x_offset, y_scale):
     """
     Returns a list of tuples (peak_freq, peak_height) corresponding to locations and relative heights of peaks in the
     saturated absorption spectrum, given the excited state hyperfine constants as input parameters.
@@ -471,7 +474,7 @@ def get_peak_locations_and_heights(Ae, Be, x_offset, y_scale):
     return transitions
 
 
-def get_peak_locations(Ae, Be):
+def get_peak_locations(Ag, Bg, Ae, Be):
     """
     Returns a list of floats corresponding to locations of peaks in the saturated absorption spectrum, given the excited
     state hyperfine constants as input parameters.  Note that this doesn't return peak heights.
@@ -513,7 +516,7 @@ def saturated_absorption_signal(transitions, linewidth, v_lines, x_other=None, y
         plt.axvline(x=f)
     plt.scatter(x_other, y_other, s=0.5, color='k')
     plt.scatter(x, y, s=2, color='r')
-    plt.xlabel('Detuning (MHz)')
+    plt.xlabel('Beat Frequency (MHz)')
     plt.ylabel('Absorption Signal (arb.)')
     plt.show()
 
@@ -550,7 +553,7 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
     applied_offset = 0
     offset_step = 10
     num_steps = 200
-    while offset_step > 0.001:
+    while offset_step > 1e-6:
         best_offset = 0
         best_error_metric = 1e100
         for i in range(- num_steps / 2, num_steps / 2):
@@ -558,7 +561,6 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
             freq_shifted = [x + curr_offset for x in freq_calculated]
             errors = get_nearest_differences(freq_measured, freq_shifted)
             mean_sq_error = sum(x*x for x in errors) / len(freq_measured)
-            # print "offset {}, error {}".format(curr_offset, mean_sq_error)
             if mean_sq_error < best_error_metric:
                 best_error_metric = mean_sq_error
                 best_offset = curr_offset
@@ -567,7 +569,7 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
     return [x + applied_offset for x in freq_calculated]
 
 
-def get_fitting_error(measured_freq, Ae, Be):
+def get_fitting_error(measured_freq, Ag, Bg, Ae, Be):
     """
     Returns mean-squared errors for an optimally-shifted set of calculated frequencies from the given hyperfine
     coefficients.
@@ -577,7 +579,7 @@ def get_fitting_error(measured_freq, Ae, Be):
     :param Be:              Excited state B hyperfine coefficient in MHz (electric quadrupole)
     :return:                Total mean-squared fitting error
     """
-    transition_locations = get_peak_locations(Ae, Be)
+    transition_locations = get_peak_locations(Ag, Bg, Ae, Be)
     transition_locations.sort()
     adjusted = adjust_offset_to_minimize_error(measured_freq, transition_locations)
     diff = get_nearest_differences(measured_freq, adjusted)
@@ -604,7 +606,7 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
     mean_sq_error = numpy.zeros((len(hyperfine_A), len(hyperfine_B)))
     for i in tqdm(range(grid_points), ascii=True):
         for j in range(grid_points):
-            mean_sq_error[i][j] = get_fitting_error(measured_freq, x[i][j], y[i][j])
+            mean_sq_error[i][j] = get_fitting_error(measured_freq, A_ground, B_ground, x[i][j], y[i][j])
     fig, ax = plt.subplots()
     CS = ax.contour(x, y, mean_sq_error)
     ax.clabel(CS, inline=1, fontsize=10)
@@ -614,43 +616,91 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
     plt.show()
 
 
+def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_Be):
+    """
+    Uses gradient descent to iteratively find values for the hyperfine constants which minimize the given metric for
+    quantifying goodness-of-fit.  It uses the function is used in get_fitting_error() and stops once the absolute error
+    between steps drops below a set threshold.
+
+    :param measured_freq:   Measured frequencies to fit
+    :param init_Ae:          Initial value for hyperfine A
+    :param init_Be:          Initial value for hyperfine B
+    :return:                Values A, B which minimize the fitting error
+    """
+    step_grad = 1
+    curr_Ag = init_Ag
+    curr_Bg = init_Bg
+    curr_Ae = init_Ae
+    curr_Be = init_Be
+    prev_error = 1e30
+    curr_error = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae, curr_Be)
+    asym_factor = 300
+    while abs(curr_error - prev_error) > 1e-8:
+        grad_Ag = get_fitting_error(measured_freq, curr_Ag + step_grad, curr_Bg, curr_Ae, curr_Be) - curr_error
+        grad_Bg = get_fitting_error(measured_freq, curr_Ag, curr_Bg + step_grad, curr_Ae, curr_Be) - curr_error
+        grad_Ae = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae + step_grad, curr_Be) - curr_error
+        grad_Be = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae, curr_Be + step_grad) - curr_error
+        grad_Ag *= 0
+        grad_Bg *= 0
+        grad_Bg *= asym_factor
+        grad_Be *= asym_factor
+        grad_tot = pow(grad_Ag * grad_Ag + grad_Bg * grad_Bg + grad_Ae * grad_Ae + grad_Be * grad_Be, 0.5) + 1e-20
+        curr_Ag -= grad_Ag / grad_tot * step_grad
+        curr_Bg -= grad_Bg / grad_tot * step_grad
+        curr_Ae -= grad_Ae / grad_tot * step_grad
+        curr_Be -= grad_Be / grad_tot * step_grad
+        step_grad = min(grad_tot / 14, step_grad)
+        prev_error = curr_error
+        curr_error = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae, curr_Be)
+        print "Error {}, step {} ({}, {}, {}, {})".format(curr_error, step_grad,
+                                                          curr_Ag, curr_Bg, curr_Ae, curr_Be)
+
+    return curr_Ag, curr_Bg, curr_Ae, curr_Be
+
+
 # Read data from the analog in
 data_time = 10
 sampleRateInHz = 500000
 numChannels = 2
 numSamples = data_time * sampleRateInHz
-# sample_data(numSamples, sampleRateInHz, numChannels, "fast_sweeps2.npy")
-# freq, signal = combine_raw_data("fast_sweeps2.npy")
-# process_data(freq, signal, "combined_sweeps.npy")
+curr_file = "peak_7.npy"
+# sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
+# freq, signal = combine_raw_data(curr_file)
+# process_data(freq, signal, "poster_data.npy")
 
-x_plot, plot_data = read_spectroscopy_data("combined_sweeps.npy", 8.7e5, 17.4e5)
-x_plot = numpy.linspace(500, -500, len(plot_data))
-plot_data = [10.5*val+0.25 for val in plot_data]
+x_plot, plot_data = read_spectroscopy_data("poster_data.npy", 8.1e5, 19.9e5)
+plot_data = [3.25*val+0.4 for val in plot_data]
+# x_plot, plot_data = read_spectroscopy_data("combined_sweeps.npy", 8.7e5, 17.4e5)
+# plot_data = [10.5*val+0.25 for val in plot_data]
+x_plot = numpy.linspace(545+680, -485+680, len(plot_data))
 
-data_freq = [-221.3, -216.0, -128.5, 4.1, 92.9, 131.5, 217.7, 217.7]
-data_uncertainty = [3.5, 4.9, 5.9, 2.8, 3.4, 3.6, 4.4, 4.4]
-measured_freq = [-2*f for f in data_freq]
+# First point is duplicated since it's assumed to be two degenerate peaks
+data_freq = [142.8, 142.8, 211.6, 244.1, 325.8, 461.1, 552.1, 563.1]
+data_uncertainty = [5.4, 5.4, 4.9, 3.2, 4.8, 4.1, 4.9, 4.4]
+measured_freq = [2*f for f in data_freq]
 measured_uncertainty = [2*f for f in data_uncertainty]
-# generate_contour_plot(measured_freq, 728.2, 729.3, 870, 930, 100)
-A_range = (715.8-0.7, 716.0+0.7)
-B_range = (997-64, 1017+64)
-# generate_contour_plot(measured_freq, A_range[0], A_range[1], B_range[0], B_range[1], 20)
+A_range = (715.8, 716.0)
+B_range = (930, 960)
+A_ground = 800.583645
+B_ground = -1668.00527
+A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq, 800.583645, -1668.00527, 718, 940)
+A_div = 0.3
+B_div = 30
+generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
 
-A_fitted = (A_range[0] + A_range[1]) / 2
-B_fitted = (B_range[0] + B_range[1]) / 2
-print "Plotting with A={} and B={}".format(A_fitted, B_fitted)
-calc_transitions = get_peak_locations(A_fitted, B_fitted)
+print "Plotting with Ag={} and Bg={}".format(A_ground, B_ground)
+print "              Ae={} and Be={}".format(A_fitted, B_fitted)
+calc_transitions = get_peak_locations(A_ground, B_ground, A_fitted, B_fitted)
 calc_transitions.sort()
 adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
 measured_freq.sort()
-'''
+
 print measured_freq
 print adjusted
 chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
-print chi2
-'''
+print "chi2 value = {}".format(chi2)
+
 shift = calc_transitions[0] - adjusted[0]
-fitted_transitions = get_peak_locations_and_heights(A_fitted, B_fitted, shift, 1)
+fitted_transitions = get_peak_locations_and_heights(A_ground, B_ground, A_fitted, B_fitted, shift, 1)
 print fitted_transitions
 saturated_absorption_signal(fitted_transitions, 17, measured_freq, x_other=x_plot, y_other=plot_data)
-
