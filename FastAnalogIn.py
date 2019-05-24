@@ -2,6 +2,7 @@ import pydaqmx
 import numpy
 import ctypes
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 from operator import itemgetter
 from tqdm import tqdm
 import Queue
@@ -15,7 +16,7 @@ Jg = 15 / 2.
 Je = 17 / 2.
 
 
-def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
+def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name):
     """
     Read data from specified analog input channels at with a specified rate and duration.  Default channels to be
     read are 0 and 1, which should be changed via analog_in_location (within the function code) in order to suit
@@ -30,7 +31,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
     :param sample_rate_in_hz:   Number of data points taken per second
     :param num_channels:        Number of channels to read data from (analog_in_location must be modified if not reading
         from the first two channels)
-    :param file_name:           Number of the file to save data into (assumed to be local directory)
+    :param save_to_file_name:   Name of the file to save data into (assumed to be local directory)
     :return:                    None (writes data into "data.npy")
     """
     # This assumes the specified channels are the first ones
@@ -109,7 +110,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, file_name):
                         has_data = True
 
         # Combine all data and save it to a file
-        f = open(file_name, mode='wb+')
+        f = open(save_to_file_name, mode='wb+')
         numpy.save(f, numpy.append(numpy.append(header_segment, analog_segment), counter_segment))
         print "Data written to file"
 
@@ -129,8 +130,11 @@ def initialize_frequency_counter_state(counter):
     """
     Send all the relevant commands over GPIB to the frequency counter in order to optimize throughput, see
         https://literature.cdn.keysight.com/litweb/pdf/53131-90044.pdf?id=1000000328-1:epsg:man
-    on section "To Optimize Throughput" (page 3-73) for details on what each command does
+    on section "To Optimize Throughput" (page 3-73) for details on what each command does.  Note that many of these
+    commands don't persist after power-cycling the frequency counter.
+
     :param counter: A reference to the GPIB connection to the frequency counter as given by pyvisa
+    :return:        None
     """
     counter.write("*RST")
     counter.write("*CLS")
@@ -153,38 +157,38 @@ def initialize_frequency_counter_state(counter):
     counter.write(":INIT:CONT ON")
 
 
-def combine_raw_data(file_name):
+def combine_raw_data(read_from_file_name):
     """
     Parse the data from the given file, reading from the array assuming the same data format convention noted in the
     docstring for sample_data().  It reads the analog data and associates it with the given timebase in the data file
     header, then assumes the frequency counter shares the same time base.  Then, assuming that the analog data is a
     function y(t) and the counter data is x(t), combines them together in order to produce data of the form y(x)
 
-    :param file_name:   Name of the file to read data from, assumed to be in the local directory.
-    :return:            x,y such that
+    :param read_from_file_name:     Name of the file to read data from, assumed to be in the local directory.
+    :return:                        Combined and filtered data in the format x,y
     """
-    # Read all the data out and parse the header data
-    f = open(file_name, mode='rb+')
-    all_data = numpy.load(f)
+    # Read all the data out, parsing the header data appropriately
+    data_file = open(read_from_file_name, mode='rb+')
+    all_data = numpy.load(data_file)
     header_length = int(all_data[0])
     samples_per_channel = int(all_data[1])
     num_channels = int(all_data[3])
     num_analog_samples = int(samples_per_channel * num_channels)
     time_span = 1.0 * all_data[1] / all_data[2]
 
-    # Analog input data (index 1 is spectroscopy signal)
-    channel_index = 1
-    analog_data = all_data[header_length:(num_analog_samples + header_length)]
-    x_analog = numpy.linspace(0, time_span, samples_per_channel)
-    y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
-    print "Reading {} analog points".format(len(x_analog))
-
     # Voltage ramp data (index 0)
     channel_index = 0
     ramp_data = all_data[header_length:(num_analog_samples + header_length)]
     x_ramp = numpy.linspace(0, time_span, samples_per_channel)
     y_ramp = [ramp_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
-    print "Reading {} analog points".format(len(x_analog))
+    print "Reading {} analog points from voltage ramp".format(len(x_ramp))
+
+    # Analog input data (index 1 is spectroscopy signal)
+    channel_index = 1
+    analog_data = all_data[header_length:(num_analog_samples + header_length)]
+    x_analog = numpy.linspace(0, time_span, samples_per_channel)
+    y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
+    print "Reading {} analog points from spectroscopy channel".format(len(x_analog))
 
     """
     Parse the frequency counter data with some invalid data rejection.  First, sample the first sample_window gaps
@@ -213,22 +217,16 @@ def combine_raw_data(file_name):
             valid_index.extend([False])
     valid_index.extend([False])
     valid_index.extend([False])
-    x_counter = [x_counter_raw[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
     y_counter = [raw_counter_data[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
     print "{} counter points, filtered to {}".format(len(raw_counter_data), len(y_counter))
 
-    # Print average frequency and standard deviation
+    # Print average, standard deviation, and range of frequency readings
+    # This is meant to be a sanity check to make sure filtering didn't go horribly wrong
     avg_freq = sum(raw_counter_data) / len(raw_counter_data)
     variances = [pow(raw_counter_data[i] - avg_freq, 2) for i in range(len(raw_counter_data))]
     stdev = pow(sum(variances) / len(raw_counter_data), 0.5)
     print "Avg. frequency {}, stdev {}, range ({}, {})".format(sum(raw_counter_data) / len(raw_counter_data), stdev,
                                                                min(raw_counter_data), max(raw_counter_data))
-    """
-    plt.hist(raw_counter_data)
-    plt.xlabel("Frequency Measurement")
-    plt.ylabel("Occurrences")
-    plt.show()
-    """
 
     """
     Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
@@ -251,46 +249,14 @@ def combine_raw_data(file_name):
                 is_output_inverted = not is_output_inverted
             data_slope_increasing = curr_data_slope_increasing
         unfolded_counter_data[i] = y_counter[i] * (-1 if is_output_inverted else 1)
-    # Go back through and invert any points missed near the turning points
-    '''y_counter = unfolded_counter_data
-    zero_margin = 50
-    for i in range(index_margin, len(x_counter)):
-        if abs(y_counter[i]) < zero_margin:
-            slope = y_counter[i - 1] - y_counter[i - 3]
-            estimate = y_counter[i - 1] + slope / 2.0
-            if abs(-y_counter[i] - estimate) < abs(y_counter[i] - estimate):
-                y_counter[i] *= -1'''
-
-    '''
-    # Combine the counter and analog data using linear interpolation from the counter data (analog_pts >> counter_pts)
-    x1c = x_ramp[0]
-    y1c = y_ramp[0]
-    x2c = x_ramp[1]
-    y2c = y_ramp[1]
-    counter_index = 1
-    x_combined = []
-    y_combined = []
-    for i in range(len(x_analog)):
-        if x_analog[i] > x2c:
-            counter_index += 1
-            if counter_index == len(x_counter):
-                break
-            x1c = x2c
-            y1c = y2c
-            x2c = x_counter[counter_index]
-            y2c = y_counter[counter_index]
-        if valid_index[counter_index - 1] and valid_index[counter_index]:
-            x_combined.extend([(x_analog[i] - x1c) / (x2c - x1c) * (y2c - y1c) + y1c])
-            y_combined.extend([y_analog[i]])
-    '''
 
     # Combine ramp and spectroscopy data
     x_combined = []
     y_combined = []
+    print "Combining ramp and spectroscopy data..."
     for i in tqdm(range(len(x_ramp)), ascii=True):
         x_combined.extend([y_ramp[i]])
         y_combined.extend([y_analog[i]])
-
 
     # Plot raw data
     fig, ax1 = plt.subplots()
@@ -303,8 +269,9 @@ def combine_raw_data(file_name):
     plt.show()
 
     plt.scatter(x_combined, y_combined, s=0.5)
-    plt.xlabel('Beat Frequency (MHz)')
+    plt.xlabel('Voltage Ramp (V)')
     plt.ylabel('Preamp Output (V)')
+    plt.title('Combined analog input data')
     plt.show()
 
     return x_combined, y_combined
@@ -312,13 +279,21 @@ def combine_raw_data(file_name):
 
 def read_spectroscopy_data(file_name, start_index, end_index):
     """
-    Temporary function for reading out raw spectroscopy data.  Assumes all x values followed by all y values.
+    Temporary function for reading out raw spectroscopy data from a file, assumes all x values followed by all y values.
+    Arguments allow for selecting a subsequence of all the data for very quick trimming.  Since the data sets generally
+    have a few hundred thousand very closely-spaced points which are mostly redundant, there is also built-in filtering
+    to only take every 10th point.
+
+    In practice this doesn't visually change when the data is immediately plotted afterwards, but it vastly speeds up
+    the plotting time.
 
     :param file_name:   Name of the file to read data from, assumed to be in the local directory.
+    :param start_index: Starting index for quick data trimming
+    :param end_index:   Ending index for quick data trimming
     """
     # Read all the data out
-    f = open(file_name, mode='rb+')
-    all_data = numpy.load(f)
+    data_file = open(file_name, mode='rb+')
+    all_data = numpy.load(data_file)
     x_analog = all_data[:len(all_data) / 2]
     y_analog = all_data[len(all_data) / 2:]
     x_analog = x_analog[start_index: end_index]
@@ -331,13 +306,16 @@ def read_spectroscopy_data(file_name, start_index, end_index):
     return x_analog, y_analog
 
 
-def process_data(x_raw, y_raw, file_name):
+def process_data(x_raw, y_raw, save_to_file_name):
     """
     Filter out invalid segments of data based on certain patterns and average together what is left.  The particular
     filtering processes are due to some unstable experimental artifacts specific to the holmium setup and may not be
     needed for general usage on other setups.
 
-    :return: A list of (x,y) tuples containing the averaged data
+    :param x_raw:               List of x values for the data to filter
+    :param y_raw:               List of y values for the data to filter, assumed to have the same dimensions of x_raw
+    :param save_to_file_name:   Starting index for quick data trimming
+    :return:                    A list of (x,y) tuples containing the averaged data
     """
 
     """
@@ -386,10 +364,13 @@ def process_data(x_raw, y_raw, file_name):
     xy_pairs.sort(key=itemgetter(0))
 
     """
-    The electronics on the actual saturated absorption setup cause the baseline doppler-broadened curve to be slightly
-    different between different data sets, so a baseline curve is calculated by performing a moving average with a
-    very large moving window (in this case 10% of the entire span) in order to effectively remove the spectroscopy
-    signal from the doppler-broadened curve.
+    The electronics on the actual saturated absorption setup cause a baseline curve which is a combination of slightly
+    mismatched beam powers and doppler broadening, so a baseline curve is calculated by performing a moving average with
+    a very large moving window (in this case 5% of the entire span) in order to effectively remove the baseline curve
+    so that all which is left is the spectroscopy signal.
+    
+    In practice this baseline curve varies between different data sets but stays relatively constant on any particular
+    run of taking data, so it needs to be calculated on a per-file basis.
     """
     xb = []
     yb = []
@@ -413,6 +394,10 @@ def process_data(x_raw, y_raw, file_name):
     Now the actual spectroscopy data itself is constructed with a moving average, in this case with a window size of
         num_ramps * ramp_jaggedness
     with the baseline doppler-broadened curve subtracted out.
+    
+    This averaging is meant to accomplish the task of averaging together multiple sweeps, but it needs to be done with a
+    moving average approach because the x values won't necessarily be identical between sweeps because they come from an
+    analog input channel and not a consistent timebase.
     """
     x3 = []
     y3 = []
@@ -441,15 +426,16 @@ def process_data(x_raw, y_raw, file_name):
 
     # Plotting code to show processed data for visual checking
     plt.scatter(x4, y4, s=0.5)
-    plt.xlabel('Beat Frequency (MHz)')
+    plt.xlabel('Ramp Voltage (V)')
     plt.ylabel('Preamp Output (V)')
+    plt.title('Data after filtering and averaging')
     plt.show()
 
     # Append both data sets together and save to a file.  Further processing should assume x and y of equal lengths due
     # to the data formatting, which is a list of (x,y) points
-    f = open(file_name, mode='wb+')
-    numpy.save(f, numpy.append(x4, y4))
-    print 'Data saved to file "{}"'.format(file_name)
+    data_file = open(save_to_file_name, mode='wb+')
+    numpy.save(data_file, numpy.append(x4, y4))
+    print 'Data saved to file "{}"'.format(save_to_file_name)
 
     return [(x3[i], y3[i]) for i in range(len(x3))]
 
@@ -457,8 +443,10 @@ def process_data(x_raw, y_raw, file_name):
 def get_peak_locations_and_heights(Ag, Bg, Ae, Be, x_offset, y_scale):
     """
     Returns a list of tuples (peak_freq, peak_height) corresponding to locations and relative heights of peaks in the
-    saturated absorption spectrum, given the excited state hyperfine constants as input parameters.
+    saturated absorption spectrum, given all of the hyperfine constants as input parameters.
 
+    :param Ag:          Ground state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Bg:          Ground state B hyperfine coefficient in MHz (electric quadrupole)
     :param Ae:          Excited state A hyperfine coefficient in MHz (magnetic dipole)
     :param Be:          Excited state B hyperfine coefficient in MHz (electric quadrupole)
     :param x_offset:    Shift to apply to all peaks in order to appropriately fit the data
@@ -479,9 +467,12 @@ def get_peak_locations_and_heights(Ag, Bg, Ae, Be, x_offset, y_scale):
 
 def get_peak_locations(Ag, Bg, Ae, Be):
     """
-    Returns a list of floats corresponding to locations of peaks in the saturated absorption spectrum, given the excited
-    state hyperfine constants as input parameters.  Note that this doesn't return peak heights.
+    Returns a list of floats corresponding to locations of peaks in the saturated absorption spectrum, given all of the
+    hyperfine constants as input parameters.  Note that this doesn't return peak heights, and that the transitions are
+    sorted in order of F and thus may not be strictly increasing or decreasing.
 
+    :param Ag:          Ground state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Bg:          Ground state B hyperfine coefficient in MHz (electric quadrupole)
     :param Ae:          Excited state A hyperfine coefficient in MHz (magnetic dipole)
     :param Be:          Excited state B hyperfine coefficient in MHz (electric quadrupole)
     :return:            List of floats
@@ -507,6 +498,9 @@ def saturated_absorption_signal(transitions, linewidth, v_lines, x_other=None, y
     :param transitions:     Transition list from get_peak_locations_and_heights()
     :param linewidth:       Linewidth of the main transition in MHz, scaled by the factors in the transition list for
         each individual peak
+    :param v_lines:         List of vertical lines to overlap on top of the plot at specified x values
+    :param x_other:         X values for a scatterplot to overlay over the calculated curve
+    :param y_other:         Y values for a scatterplot to overlay over the calculated curve
     :return:                None; produces a plot instead
     """
     low_x = min([a[0] for a in transitions]) - 5*linewidth
@@ -517,22 +511,34 @@ def saturated_absorption_signal(transitions, linewidth, v_lines, x_other=None, y
 
     fig, ax = plt.subplots()
     ax.grid()
+    for val in v_lines:
+        plt.axvline(x=val)
+
+    # Automatically draw lines at the locations of peaks in "transitions" and label them appropriately
+    for Fg in range(4, 12):
+        trans = transitions[Fg - 4]
+        plt.axvline(x=trans[0])
+        plt.text(trans[0], 3.75 - 0.15 * Fg, "{} to {}'".format(Fg, Fg + 1), horizontalalignment='center',
+                 verticalalignment='center', fontsize=16)
+
+    black = mpatches.Patch(color='black', label='Experimental data')
+    red = mpatches.Patch(color='red', label='Calculated fit')
+    plt.legend(handles=[black, red], loc="upper left")
     fig.patch.set_facecolor('white')
-    #for f in v_lines:
-        #plt.axvline(x=f)
     plt.scatter(x_other, y_other, s=0.5, color='k')
     plt.scatter(x, y, s=1, color='r')
     plt.xlabel('Beat Frequency (MHz)')
     plt.ylabel('Absorption Signal (arb. units)')
     plt.xlim(200, 1200)
-    plt.ylim((-0.3, 2.3))
+    plt.ylim((-0.3, 3.3))
     plt.show()
 
 
 def get_nearest_differences(measured, calculated):
     """
     Returns the a list of values corresponding to the absolute difference between each value in measured and the nearest
-    value in calculated to that value.
+    value in calculated to that value.  DO NOT CHANGE THE ERROR METRIC IN THIS FUNCTION, CHANGE IT IN
+    adjust_offset_to_minimize_error() INSTEAD IF NEEDED.
 
     :param measured:    List of measured values to get differences for
     :param calculated:  List of reference values to compare against
@@ -545,10 +551,26 @@ def get_nearest_differences(measured, calculated):
     return [abs(meas[i] - calc[i]) for i in range(len(meas))]
 
 
+def calculate_error_metric(value_list):
+    """
+    Given a list of values corresponding to differences between peak heights, calculate an appropriate error metric for
+    the gradient descent to minimize.  This function primarily exists because the error metric is used in more than one
+    place, so changing it here affects all relevant code.  In principle this should always just be the squared error.
+
+    :param value_list:  List of values to calculate error metric for
+    :return:            A float representing the error metric value
+    """
+    return sum(x*x for x in value_list)
+
+
 def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
     """
     Adjusts the calculated frequencies with an offset in order to find a shifted frequency set that minimizes the
-    mean-squared error between each measured peak and its corresponding nearest calculated peak.
+    error metric between each measured peak and its corresponding nearest calculated peak.
+
+    This function finds the best-fit value within a certain range of a specified center, then picks a new center based
+    on the best within this range.  Then it takes this center and produces a smaller range around it before repeating
+    this process, until the gap between adjacent steps in the range drops below the 1e-6 threshold.
 
     :param freq_measured:       List of measured peaks
     :param freq_calculated:     List of calculated peaks (assumed to be sorted)
@@ -558,6 +580,7 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
     center_calculated = (min(freq_calculated) + max(freq_calculated)) / 2
     freq_calculated = [x - (center_calculated - center_measured) for x in freq_calculated]
 
+    # Iteratively improve the offset via repeatedly picking the optimal fit within a range and shrinking the range
     applied_offset = 0
     offset_step = 10
     num_steps = 200
@@ -568,7 +591,7 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
             curr_offset = applied_offset + i * offset_step
             freq_shifted = [x + curr_offset for x in freq_calculated]
             errors = get_nearest_differences(freq_measured, freq_shifted)
-            mean_sq_error = sum(x*x for x in errors) / len(freq_measured)
+            mean_sq_error = calculate_error_metric(errors) / len(freq_measured)
             if mean_sq_error < best_error_metric:
                 best_error_metric = mean_sq_error
                 best_offset = curr_offset
@@ -579,25 +602,30 @@ def adjust_offset_to_minimize_error(freq_measured, freq_calculated):
 
 def get_fitting_error(measured_freq, Ag, Bg, Ae, Be):
     """
-    Returns mean-squared errors for an optimally-shifted set of calculated frequencies from the given hyperfine
-    coefficients.
+    Returns the value for the error metric for an optimally-shifted set of calculated frequencies from the given
+    hyperfine coefficients.
 
     :param measured_freq:   List of measured frequencies, in MHz
+    :param Ag:              Ground state A hyperfine coefficient in MHz (magnetic dipole)
+    :param Bg:              Ground state B hyperfine coefficient in MHz (electric quadrupole)
     :param Ae:              Excited state A hyperfine coefficient in MHz (magnetic dipole)
     :param Be:              Excited state B hyperfine coefficient in MHz (electric quadrupole)
-    :return:                Total mean-squared fitting error
+    :return:                Total value of the error metric
     """
     transition_locations = get_peak_locations(Ag, Bg, Ae, Be)
     transition_locations.sort()
-    adjusted = adjust_offset_to_minimize_error(measured_freq, transition_locations)
-    diff = get_nearest_differences(measured_freq, adjusted)
-    return sum(abs(x) for x in diff)
+    shifted = adjust_offset_to_minimize_error(measured_freq, transition_locations)
+    diff = get_nearest_differences(measured_freq, shifted)
+    return calculate_error_metric(diff)
 
 
 def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points):
     """
-    Generates a coutour plot of the optimized mean-squared error between the measured spectrum and a spectrum generated
-    from hyperfine constants within the ranges defined by the parameters.
+    Generates a contour plot of the minimized error between the measured spectrum and a spectrum generated from
+    hyperfine constants.  The range of the contour plot is defined by the parameters.
+
+    The ground state values are assumed to be in A_ground, B_ground from the outer scope.  These generally should not be
+    changed.
 
     :param measured_freq:   List of peaks
     :param A_min:           Lower bound of hyperfine constant A (MHz)
@@ -612,6 +640,7 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
     hyperfine_B = numpy.linspace(B_min, B_max, grid_points)
     x, y = numpy.meshgrid(hyperfine_A, hyperfine_B)
     mean_sq_error = numpy.zeros((len(hyperfine_A), len(hyperfine_B)))
+    print "Generating Contour plot..."
     for i in tqdm(range(grid_points), ascii=True):
         for j in range(grid_points):
             mean_sq_error[i][j] = get_fitting_error(measured_freq, A_ground, B_ground, x[i][j], y[i][j])
@@ -627,8 +656,16 @@ def generate_contour_plot(measured_freq, A_min, A_max, B_min, B_max, grid_points
 def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_Be):
     """
     Uses gradient descent to iteratively find values for the hyperfine constants which minimize the given metric for
-    quantifying goodness-of-fit.  It uses the function is used in get_fitting_error() and stops once the absolute error
-    between steps drops below a set threshold.
+    quantifying goodness-of-fit.  It uses the function is used in calculate_error_metric() and stops once the absolute
+    error between steps drops below a set threshold.  It attempts to optimize all four hyperfine coefficients, but any
+    of them can be dummied out as needed by multiplying its corresponding grad_XX by zero.
+
+    In order to discourage large changes in the ground hyperfine constant, they are suppressed by 1/100.  There is also
+    an asymmetry factor to account for any numerical problems potentially stemming from the significantly different
+    sensitivity between A and B.
+
+    This might not be fully working quite yet, but as of now it seems to work "well enough" although step_grad seems to
+    need adjustment if the error metric is changed.
 
     :param measured_freq:   Measured frequencies to fit
     :param init_Ae:          Initial value for hyperfine A
@@ -672,34 +709,35 @@ sampleRateInHz = 500000
 numChannels = 2
 numSamples = data_time * sampleRateInHz
 curr_file = "new_data.npy"
-#sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
-#freq, signal = combine_raw_data(curr_file)
-#process_data(freq, signal, "new_combined.npy")
-#process_data(freq, signal, "poster_data.npy")
+# Data acquisition and filtering/combining temporarily commented out
+"""
+sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
+freq, signal = combine_raw_data(curr_file)
+process_data(freq, signal, "new_combined.npy")
+"""
 
-#x_plot, plot_data = read_spectroscopy_data("poster_data.npy", 8.0e5, 19.8e5)
-#plot_data = [3.25*val+0.4 for val in plot_data]
-# x_plot, plot_data = read_spectroscopy_data("combined_sweeps.npy", 8.6e5, 17.4e5)
-# plot_data = [10.5*val+0.25 for val in plot_data]
+# Quick-and-dirty trimming and rescaling of raw data to visually fit the calculated curve
 x_plot, plot_data = read_spectroscopy_data("new_combined.npy", 24.5e5, 38.9e5)
-plot_data = [16*val+0.2 for val in plot_data]
+plot_data = [14 * val + 0.2 for val in plot_data]
 x_plot = numpy.linspace(545+680, -485+680, len(plot_data))
 
-# First point is duplicated since it's assumed to be two degenerate peaks
+# First point is duplicated since it's assumed to be two degenerate peaks.  This is roughly consistent with its height
 data_freq = [142.8, 142.8, 211.6, 244.1, 325.8, 461.1, 552.1, 563.1]
-data_freq = [142.8, 142.8, 220. , 254. , 332. , 458. , 552.1, 563.1]
+# The next line is meant to force the fitting to match the taken data better
+# data_freq = [142.8, 142.8, 220. , 254. , 332. , 458. , 552.1, 563.1]
 data_uncertainty = [5.4, 5.4, 4.9, 3.2, 4.8, 4.1, 4.9, 4.4]
+# Beat frequency is in the IR, actual spectroscopy is in the blue after SHG
 measured_freq = [2*f for f in data_freq]
 measured_uncertainty = [2*f for f in data_uncertainty]
-A_range = (715.8, 716.0)
-B_range = (930, 960)
 A_ground = 800.583645
 B_ground = -1668.00527
-#A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq, 800.583645, -1668.00527, 718, 950)
+
+
+# A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq, 800.583645, -1668.00527, 718, 950)
 A_ground, B_ground, A_fitted, B_fitted = 800.583645, -1668.00527, 715.992, 925.975
-A_div = 0.9
-B_div = 90
-#generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
+A_div = 1.5
+B_div = 120
+# generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
 
 print "Plotting with Ag={} and Bg={}".format(A_ground, B_ground)
 print "              Ae={} and Be={}".format(A_fitted, B_fitted)
@@ -708,12 +746,13 @@ calc_transitions.sort()
 adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
 measured_freq.sort()
 
-print measured_freq
-print adjusted
+# Chi-squared value calculation
+print "Measured frequencies: {}".format(measured_freq)
+print "Calculated shifted frequencies: {}".format(adjusted)
 chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
 print "chi2 value = {}".format(chi2)
 
+# Generate plot
 shift = calc_transitions[0] - adjusted[0]
 fitted_transitions = get_peak_locations_and_heights(A_ground, B_ground, A_fitted, B_fitted, shift, 1)
-print fitted_transitions
-saturated_absorption_signal(fitted_transitions, 13, measured_freq, x_other=x_plot, y_other=plot_data)
+saturated_absorption_signal(fitted_transitions, 13, [], x_other=x_plot, y_other=plot_data)
