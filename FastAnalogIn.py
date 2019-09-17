@@ -328,9 +328,11 @@ def process_data(x_raw, y_raw, save_to_file_name):
     strictly increasing at all points.
     """
     ramp_jaggedness = 5
-    ascending_ramp_indices = [i for i in range(len(x_raw) - ramp_jaggedness) if x_raw[i] < x_raw[i + ramp_jaggedness]]
-    x1 = [x_raw[i] for i in ascending_ramp_indices]
-    y1 = [y_raw[i] for i in ascending_ramp_indices]
+    offset = 3000
+    ascending_ramp_indices = [i for i in range(len(x_raw) - ramp_jaggedness - offset)
+                              if x_raw[i] > x_raw[i + ramp_jaggedness]]
+    x1 = [x_raw[i + offset] for i in ascending_ramp_indices]
+    y1 = [y_raw[i + offset] for i in ascending_ramp_indices]
 
     """
     The laser sometimes has a tendency to unlock, which effectively invalidates that entire period of the ramp.
@@ -517,19 +519,20 @@ def saturated_absorption_signal(transitions, linewidth, v_lines, x_other=None, y
     # Automatically draw lines at the locations of peaks in "transitions" and label them appropriately
     for Fg in range(4, 12):
         trans = transitions[Fg - 4]
-        plt.axvline(x=trans[0])
+        # plt.axvline(x=trans[0])
         plt.text(trans[0], 3.75 - 0.15 * Fg, "{} to {}'".format(Fg, Fg + 1), horizontalalignment='center',
                  verticalalignment='center', fontsize=16)
 
-    black = mpatches.Patch(color='black', label='Experimental data')
-    red = mpatches.Patch(color='red', label='Calculated fit')
-    plt.legend(handles=[black, red], loc="upper left")
+    black = mpatches.Patch(color='black', label='Older sweep data')
+    red = mpatches.Patch(color='red', label='Curve from fitted A,B')
+    blue = mpatches.Patch(color='blue', label='Measured frequencies')
+    plt.legend(handles=[black, red, blue], loc="upper left")
     fig.patch.set_facecolor('white')
     plt.scatter(x_other, y_other, s=0.5, color='k')
     plt.scatter(x, y, s=1, color='r')
     plt.xlabel('Beat Frequency (MHz)')
     plt.ylabel('Absorption Signal (arb. units)')
-    plt.xlim(200, 1200)
+    plt.xlim(-500, 600)
     plt.ylim((-0.3, 3.3))
     plt.show()
 
@@ -672,7 +675,7 @@ def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_B
     :param init_Be:          Initial value for hyperfine B
     :return:                Values A, B which minimize the fitting error
     """
-    step_grad = 1
+    step_grad = 0.01
     curr_Ag = init_Ag
     curr_Bg = init_Bg
     curr_Ae = init_Ae
@@ -685,8 +688,8 @@ def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_B
         grad_Bg = get_fitting_error(measured_freq, curr_Ag, curr_Bg + step_grad, curr_Ae, curr_Be) - curr_error
         grad_Ae = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae + step_grad, curr_Be) - curr_error
         grad_Be = get_fitting_error(measured_freq, curr_Ag, curr_Bg, curr_Ae, curr_Be + step_grad) - curr_error
-        grad_Ag *= 0.01
-        grad_Bg *= 0.01
+        grad_Ag *= 0
+        grad_Bg *= 0
         grad_Bg *= asym_factor
         grad_Be *= asym_factor
         grad_tot = pow(grad_Ag * grad_Ag + grad_Bg * grad_Bg + grad_Ae * grad_Ae + grad_Be * grad_Be, 0.5) + 1e-20
@@ -710,34 +713,43 @@ numChannels = 2
 numSamples = data_time * sampleRateInHz
 curr_file = "new_data.npy"
 # Data acquisition and filtering/combining temporarily commented out
-"""
-sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
-freq, signal = combine_raw_data(curr_file)
-process_data(freq, signal, "new_combined.npy")
-"""
+# sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
+# freq, signal = combine_raw_data(curr_file)
+# process_data(freq, signal, "new_combined_reverse.npy")
 
 # Quick-and-dirty trimming and rescaling of raw data to visually fit the calculated curve
-x_plot, plot_data = read_spectroscopy_data("new_combined.npy", 24.5e5, 38.9e5)
-plot_data = [14 * val + 0.2 for val in plot_data]
-x_plot = numpy.linspace(545+680, -485+680, len(plot_data))
+# x_plot, plot_data = read_spectroscopy_data("new_combined.npy", 24.5e5, 38.1e5)
+# plot_data = [14 * val + 0.2 for val in plot_data]
+# x_plot = numpy.linspace(545, -485, len(plot_data))
+x_plot, plot_data = read_spectroscopy_data("new_combined_reverse.npy", 0.0e5, 22.0e5)
+plot_data = [24 * val + 0.35 for val in plot_data]
+x_plot = numpy.linspace(470, -480, len(plot_data))
 
 # First point is duplicated since it's assumed to be two degenerate peaks.  This is roughly consistent with its height
 data_freq = [142.8, 142.8, 211.6, 244.1, 325.8, 461.1, 552.1, 563.1]
 # The next line is meant to force the fitting to match the taken data better
 # data_freq = [142.8, 142.8, 220. , 254. , 332. , 458. , 552.1, 563.1]
-data_uncertainty = [5.4, 5.4, 4.9, 3.2, 4.8, 4.1, 4.9, 4.4]
+# data_freq = [-225.2, -225.2, -134.8, -97.3, -6.8, 127.9, 211.8, 223.2]
+data_freq = [-803.5, -803.5, -717.5, -677.0, -589.0, -459.0, -368.0, -356.0]
+# data_uncertainty = [5.4, 5.4, 4.9, 3.2, 4.8, 4.1, 4.9, 4.4]
+# data_uncertainty = [5.5, 5.5, 5.6, 5.5, 5.6, 5.4, 5.6, 5.6]
+data_uncertainty = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0]
 # Beat frequency is in the IR, actual spectroscopy is in the blue after SHG
-measured_freq = [2*f for f in data_freq]
+measured_freq = [2*(f+580) for f in data_freq]
 measured_uncertainty = [2*f for f in data_uncertainty]
 A_ground = 800.583645
 B_ground = -1668.00527
 
-
-# A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq, 800.583645, -1668.00527, 718, 950)
-A_ground, B_ground, A_fitted, B_fitted = 800.583645, -1668.00527, 715.992, 925.975
-A_div = 1.5
-B_div = 120
-# generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
+'''
+A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq,
+                                                                     800.583645,
+                                                                     -1668.00527,
+                                                                     715.8,
+                                                                     1027)'''
+A_ground, B_ground, A_fitted, B_fitted = 800.583645, -1668.00527, 715.87337, 1024.67725
+A_div = 0.1
+B_div = 10
+generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
 
 print "Plotting with Ag={} and Bg={}".format(A_ground, B_ground)
 print "              Ae={} and Be={}".format(A_fitted, B_fitted)
@@ -755,4 +767,4 @@ print "chi2 value = {}".format(chi2)
 # Generate plot
 shift = calc_transitions[0] - adjusted[0]
 fitted_transitions = get_peak_locations_and_heights(A_ground, B_ground, A_fitted, B_fitted, shift, 1)
-saturated_absorption_signal(fitted_transitions, 13, [], x_other=x_plot, y_other=plot_data)
+saturated_absorption_signal(fitted_transitions, 13, measured_freq, x_other=x_plot, y_other=plot_data)
