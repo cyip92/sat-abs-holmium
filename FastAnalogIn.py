@@ -3,11 +3,9 @@ import numpy
 import ctypes
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
-from operator import itemgetter
 from tqdm import tqdm
-import Queue
 from sympy.physics.wigner import wigner_6j
-import pyvisa as visa
+import math
 import time
 
 # Atomic structure parameters (exact spin values, assumed ground state hyperfine)
@@ -35,7 +33,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name)
     :return:                    None (writes data into "data.npy")
     """
     # This assumes the specified channels are the first ones
-    analog_in_location = "Dev1/ai0:1"
+    analog_in_location = "Dev1/ai0:2"
     task_handle = pydaqmx.TaskHandle()
     read = ctypes.c_long(0)
     read_segments = 50
@@ -59,18 +57,6 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name)
         pydaqmx.DAQmxStartTask(task_handle)
 
         """
-        Set up GPIB communication with Frequency Counter; for other experimental setups that try to use this, you will
-        need to use pyvisa to query for what all the available connections are.  In order to do this in the console:
-            import pyvisa as visa
-            visa.ResourceManager().list_resources()
-        
-        See https://pyvisa.readthedocs.io/en/master/ for more tips if needed.
-        """
-        rm = visa.ResourceManager()
-        inst = rm.open_resource('GPIB::3::INSTR')
-        initialize_frequency_counter_state(inst)
-
-        """
         Read all Analog In data as a batch; for info on DAQmxReadAnalogF64() see
             https://www.ge.infn.it/~didomizi/documenti/daq/Ni_Docs/software/daqmxcfunc.chm/daqmxreadanalogf64.html
         The most important info is that it reads {2nd argument} samples per channel into the array {5th argument}.
@@ -82,7 +68,6 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name)
         """
         segment_time = 1.0 * num_samples / sample_rate_in_hz / read_segments
         print "Reading data, split into {} segments each {} seconds long".format(read_segments, segment_time)
-        counter_segment = numpy.zeros((0,), dtype=numpy.float64)
         start_time = time.time()
         for segment in range(read_segments):
             start_time += segment_time
@@ -97,25 +82,10 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name)
                                        None)
             analog_segment = numpy.append(analog_segment, segment_data)
 
-            # Continually read from the counter until the segment timer elapses
-            while time.time() - start_time < segment_time:
-                has_data = False
-                total_time = 0.02
-                meas_start = time.time()
-                while time.time() - meas_start < total_time:
-                    if not has_data:
-                        curr_counter_data = inst.query("READ:FREQ?")
-                        next_freq = float(curr_counter_data) * 1e-6     # Convert from Hz to MHz
-                        counter_segment = numpy.append(counter_segment, next_freq)
-                        has_data = True
-
         # Combine all data and save it to a file
         f = open(save_to_file_name, mode='wb+')
-        numpy.save(f, numpy.append(numpy.append(header_segment, analog_segment), counter_segment))
+        numpy.save(f, numpy.append(header_segment, analog_segment))
         print "Data written to file"
-
-        print "{} points taken from counter ({} Hz)".format(len(counter_segment),
-                                                            len(counter_segment) / (num_samples / sample_rate_in_hz))
 
     # I'm not sure how helpful the exception messages are, as (surprisingly) I haven't encountered them yet.
     except pydaqmx.DAQError as err:
@@ -126,38 +96,7 @@ def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name)
             pydaqmx.DAQmxClearTask(task_handle)
 
 
-def initialize_frequency_counter_state(counter):
-    """
-    Send all the relevant commands over GPIB to the frequency counter in order to optimize throughput, see
-        https://literature.cdn.keysight.com/litweb/pdf/53131-90044.pdf?id=1000000328-1:epsg:man
-    on section "To Optimize Throughput" (page 3-73) for details on what each command does.  Note that many of these
-    commands don't persist after power-cycling the frequency counter.
-
-    :param counter: A reference to the GPIB connection to the frequency counter as given by pyvisa
-    :return:        None
-    """
-    counter.write("*RST")
-    counter.write("*CLS")
-    counter.write("*SRE 0")
-    counter.write("*ESE 0")
-    counter.write(":STAT:PRES")
-    counter.write(":FORMAT ASCII")
-    counter.write(":FUNC 'FREQ 1'")
-    counter.write(":EVENT1:LEVEL 0")
-    counter.write(":FREQ:ARM:STAR:SOUR IMM")
-    counter.write(":FREQ:ARM:STOP:SOUR IMM")
-    counter.write(":ROSC:SOUR INT")
-    counter.write(":DIAG:CAL:INT:AUTO OFF")
-    counter.write(":DISP:ENAB OFF")
-    counter.write(":CALC:MATH:STATE OFF")
-    counter.write(":CALC2:LIM:STATE OFF")
-    counter.write(":CALC3:AVER:STATE OFF")
-    counter.write(":HCOPY:CONT OFF")
-    counter.write("*DDT #15FETC?")
-    counter.write(":INIT:CONT ON")
-
-
-def combine_raw_data(read_from_file_name):
+def read_data_from_file(read_from_file_name, show_plots):
     """
     Parse the data from the given file, reading from the array assuming the same data format convention noted in the
     docstring for sample_data().  It reads the analog data and associates it with the given timebase in the data file
@@ -167,7 +106,7 @@ def combine_raw_data(read_from_file_name):
     :param read_from_file_name:     Name of the file to read data from, assumed to be in the local directory.
     :return:                        Combined and filtered data in the format x,y
     """
-    # Read all the data out, parsing the header data appropriately
+    # Read all the data parameters out, parsing the header data appropriately
     data_file = open(read_from_file_name, mode='rb+')
     all_data = numpy.load(data_file)
     header_length = int(all_data[0])
@@ -175,106 +114,25 @@ def combine_raw_data(read_from_file_name):
     num_channels = int(all_data[3])
     num_analog_samples = int(samples_per_channel * num_channels)
     time_span = 1.0 * all_data[1] / all_data[2]
+    x_data = numpy.linspace(0, time_span, samples_per_channel)
+    print "Reading {} analog points from {} channels".format(len(x_data), num_channels)
 
-    # Voltage ramp data (index 0)
-    channel_index = 0
-    ramp_data = all_data[header_length:(num_analog_samples + header_length)]
-    x_ramp = numpy.linspace(0, time_span, samples_per_channel)
-    y_ramp = [ramp_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
-    print "Reading {} analog points from voltage ramp".format(len(x_ramp))
-
-    # Analog input data (index 1 is spectroscopy signal)
-    channel_index = 1
+    # Read the data itself
     analog_data = all_data[header_length:(num_analog_samples + header_length)]
-    x_analog = numpy.linspace(0, time_span, samples_per_channel)
-    y_analog = [analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)]
-    print "Reading {} analog points from spectroscopy channel".format(len(x_analog))
-
-    """
-    Parse the frequency counter data with some invalid data rejection.  First, sample the first sample_window gaps
-    between successive data points and set a gap threshold such that any adjacent data points separated by more than
-    1.5 times the median of these sample gaps are marked as invalid points.
-    
-    There is also an additional error_threshold value which will also reject data whose absolute values is higher than
-    what is given.  The original purpose of this was to reject error readings which by default read something very
-    around 9e32.  It can instead be used to reject clearly bogus readings such as those well outside of the counter's
-    250 MHz limit.
-    """
-    raw_counter_data = all_data[(num_analog_samples + header_length):]
-    sample_window = 40
-    sample_gaps = [abs(raw_counter_data[i + 1] - raw_counter_data[i]) for i in range(sample_window)]
-    sample_gaps.sort()
-    gap_threshold = 1.5 * sample_gaps[sample_window / 2]
-    error_threshold = 350
-    x_counter_raw = numpy.linspace(0, time_span, len(raw_counter_data))
-    valid_index = []
-    for i in range(len(raw_counter_data) - 2):
-        if (abs(raw_counter_data[i + 1] - raw_counter_data[i]) < gap_threshold
-                and abs(raw_counter_data[i + 2] - raw_counter_data[i]) < 2 * gap_threshold
-                and abs(raw_counter_data[i]) < error_threshold):
-            valid_index.extend([True])
-        else:
-            valid_index.extend([False])
-    valid_index.extend([False])
-    valid_index.extend([False])
-    y_counter = [raw_counter_data[i] for i in range(len(raw_counter_data) - 2) if valid_index[i]]
-    print "{} counter points, filtered to {}".format(len(raw_counter_data), len(y_counter))
-
-    # Print average, standard deviation, and range of frequency readings
-    # This is meant to be a sanity check to make sure filtering didn't go horribly wrong
-    avg_freq = sum(raw_counter_data) / len(raw_counter_data)
-    variances = [pow(raw_counter_data[i] - avg_freq, 2) for i in range(len(raw_counter_data))]
-    stdev = pow(sum(variances) / len(raw_counter_data), 0.5)
-    print "Avg. frequency {}, stdev {}, range ({}, {})".format(sum(raw_counter_data) / len(raw_counter_data), stdev,
-                                                               min(raw_counter_data), max(raw_counter_data))
-
-    """
-    Attempt to figure out when the frequency goes negative and adjust accordingly.  This is effectively "undoing"
-    an abs() operation on a noisy triangle ramp.  It does this by tracking and toggling some variables based on
-    derivative changes and closeness to zero.
-    
-    What happens on the experiment is that the relative frequency of the two lasers sweeps past zero and is actually
-    scanning from a negative value to a positive value, but the frequency counter only ever reads a positive value.
-    """
-    is_output_inverted = False
-    index_margin = 10
-    data_slope_increasing = y_counter[index_margin] - y_counter[0] > 0
-    unfolded_counter_data = numpy.zeros((len(y_counter),), dtype=numpy.float64)
-    for i in range(index_margin):
-        unfolded_counter_data[i] = y_counter[i]
-    for i in range(index_margin, len(y_counter)):
-        curr_data_slope_increasing = y_counter[i] - y_counter[i - index_margin] > 0
-        if curr_data_slope_increasing != data_slope_increasing:
-            if not data_slope_increasing:
-                is_output_inverted = not is_output_inverted
-            data_slope_increasing = curr_data_slope_increasing
-        unfolded_counter_data[i] = y_counter[i] * (-1 if is_output_inverted else 1)
-
-    # Combine ramp and spectroscopy data
-    x_combined = []
-    y_combined = []
-    print "Combining ramp and spectroscopy data..."
-    for i in tqdm(range(len(x_ramp)), ascii=True):
-        x_combined.extend([y_ramp[i]])
-        y_combined.extend([y_analog[i]])
+    y_data = []
+    for channel_index in range(num_channels):
+        y_data.append([analog_data[num_channels * i + channel_index] for i in range(samples_per_channel)])
 
     # Plot raw data
-    fig, ax1 = plt.subplots()
-    ax1.set_xlabel('Time (s)')
-    ax1.set_ylabel('Analog In (V)', color='r')
-    ax1.plot(x_analog, y_analog, color='r')
-    # ax2 = ax1.twinx()
-    # ax2.set_ylabel('Frequency Counter (MHz)', color='b')
-    # ax2.plot(x_counter, y_counter, color='b')
-    plt.show()
+    if show_plots:
+        for channel_index in range(num_channels):
+            fig, ax1 = plt.subplots()
+            ax1.set_xlabel('Time (s)')
+            ax1.set_ylabel("Analog In, channel {} (V)".format(channel_index), color='r')
+            ax1.plot(x_data, y_data[channel_index], color='r')
+            plt.show()
 
-    plt.scatter(x_combined, y_combined, s=0.5)
-    plt.xlabel('Voltage Ramp (V)')
-    plt.ylabel('Preamp Output (V)')
-    plt.title('Combined analog input data')
-    plt.show()
-
-    return x_combined, y_combined
+    return x_data, y_data
 
 
 def read_spectroscopy_data(file_name, start_index, end_index):
@@ -306,16 +164,17 @@ def read_spectroscopy_data(file_name, start_index, end_index):
     return x_analog, y_analog
 
 
-def process_data(x_raw, y_raw, save_to_file_name):
+def process_data(x_raw, ramp, y_raw, save_to_file_name):
     """
     Filter out invalid segments of data based on certain patterns and average together what is left.  The particular
     filtering processes are due to some unstable experimental artifacts specific to the holmium setup and may not be
     needed for general usage on other setups.
 
     :param x_raw:               List of x values for the data to filter
+    :param ramp:                List of values from the voltage ramp to use for filtering
     :param y_raw:               List of y values for the data to filter, assumed to have the same dimensions of x_raw
     :param save_to_file_name:   Starting index for quick data trimming
-    :return:                    A list of (x,y) tuples containing the averaged data
+    :return:                    A list of x values and then a list of lists of y values
     """
 
     """
@@ -328,118 +187,98 @@ def process_data(x_raw, y_raw, save_to_file_name):
     strictly increasing at all points.
     """
     ramp_jaggedness = 5
-    offset = 3000
-    ascending_ramp_indices = [i for i in range(len(x_raw) - ramp_jaggedness - offset)
-                              if x_raw[i] > x_raw[i + ramp_jaggedness]]
-    x1 = [x_raw[i + offset] for i in ascending_ramp_indices]
-    y1 = [y_raw[i + offset] for i in ascending_ramp_indices]
+    ascending_ramp_indices = [i for i in range(len(x_raw) - ramp_jaggedness)
+                              if ramp[i] < ramp[i + ramp_jaggedness]]
+    x1 = [x_raw[i] for i in ascending_ramp_indices]
+    r1 = [ramp[i] for i in ascending_ramp_indices]
+    print "{} points filtered to {} on only-ascending ramp edges".format(len(x_raw), len(ascending_ramp_indices))
+    y1 = []
+    for channel_index in range(len(y_raw)):
+        y1.append([y_raw[channel_index][i] for i in ascending_ramp_indices])
+        '''
+        fig, ax1 = plt.subplots()
+        ax1.set_xlabel('Time (s)')
+        ax1.set_ylabel("Analog In, channel {} (V)".format(channel_index), color='r')
+        ax1.plot(x1, y1[channel_index], color='r')
+        plt.show()
+        '''
 
     """
     The laser sometimes has a tendency to unlock, which effectively invalidates that entire period of the ramp.
     This checks for very large jumps in the absorption signal and only adds ramps to an ongoing data array if no
     such jumps are detected.  (The loops are done weirdly, but I'm not entirely sure to make them much better)
+    
+    This also does some horizontal shifting in order to make sure successive scans line up, using the cavity signal as
+    a reference
     """
-    x2 = []
-    y2 = []
     i = 0
     num_ramps = 0
-    while i < len(x1) - 1:
-        curr_x = []
-        curr_y = []
+    absorption_signal_index = 0
+    cavity_index = 1
+    x2 = []
+    y2 = [[], []]
+    r2 = []
+    while i < len(r1) - 1:
+        curr_ramp_indices = []
+        absorption_signal = []
         ramp_is_valid = True
-        while i < len(x1) - 1 and abs(x1[i] - x1[i+1]) < 1:
-            ramp_is_valid = ramp_is_valid and (len(curr_y) == 0 or abs(curr_y[len(curr_y) - 1] - y1[i]) < 0.5)
-            curr_x.append(x1[i])
-            curr_y.append(y1[i])
+        while i < len(r1) - 1 and abs(r1[i] - r1[i+1]) < 1:
+            curr_point = y1[absorption_signal_index][i]
+            ramp_is_valid = ramp_is_valid and (len(absorption_signal) == 0
+                                               or abs(absorption_signal[len(absorption_signal) - 1] - curr_point) < 0.5)
+            curr_ramp_indices.append(i)
+            absorption_signal.append(curr_point)
             i += 1
         if ramp_is_valid:
-            x2.extend(curr_x)
-            y2.extend(curr_y)
+            r2.extend([r1[i] for i in curr_ramp_indices])
+
+            # Find the peak of the ULE transmission and shift the ramp accordingly
+            low = min([y1[cavity_index][i] for i in curr_ramp_indices])
+            gap = max([y1[cavity_index][i] for i in curr_ramp_indices]) - low
+            above_threshold = [i for i in curr_ramp_indices if y1[cavity_index][i] > low + gap * 0.3]
+            center_index = 1. * sum(above_threshold) / len(above_threshold)
+            f = center_index - math.floor(center_index)
+            x_avg = x1[int(math.floor(center_index))] * (1 - f) + x1[int(math.ceil(center_index))] * f
+            x2.extend([x1[i] - x_avg for i in curr_ramp_indices])
+            for channel_index in range(len(y_raw)):
+                y2[channel_index].extend([y1[channel_index][i] for i in curr_ramp_indices])
             num_ramps += 1
+            i += 1
         i += 1
-    print "Found %d valid sweeps" % num_ramps
-
-    # Combine and sort all data points from the ramps in ascending x-value order
-    xy_pairs = []
-    for i in range(len(x2)):
-        xy_pairs.append([x2[i], y2[i]])
-    xy_pairs.sort(key=itemgetter(0))
-
-    """
-    The electronics on the actual saturated absorption setup cause a baseline curve which is a combination of slightly
-    mismatched beam powers and doppler broadening, so a baseline curve is calculated by performing a moving average with
-    a very large moving window (in this case 5% of the entire span) in order to effectively remove the baseline curve
-    so that all which is left is the spectroscopy signal.
-    
-    In practice this baseline curve varies between different data sets but stays relatively constant on any particular
-    run of taking data, so it needs to be calculated on a per-file basis.
-    """
-    xb = []
-    yb = []
-    bg_avg_size = len(x2) / 20
-    avg = Queue.Queue(maxsize=bg_avg_size)
-    curr_total = 0
-    for i in range(bg_avg_size/2):
-        avg.put(xy_pairs[i][1])
-        curr_total += xy_pairs[i][1]
-    for i in tqdm(range(len(x2)), ascii=True):
-        adjusted_index = i + bg_avg_size/2
-        if avg.full() or adjusted_index > bg_avg_size:
-            curr_total -= avg.get()
-        if adjusted_index < len(x2):
-            avg.put(xy_pairs[adjusted_index][1])
-            curr_total += xy_pairs[adjusted_index][1]
-        xb.append(xy_pairs[i][0])
-        yb.append(curr_total / avg.qsize())
-
-    """
-    Now the actual spectroscopy data itself is constructed with a moving average, in this case with a window size of
-        num_ramps * ramp_jaggedness
-    with the baseline doppler-broadened curve subtracted out.
-    
-    This averaging is meant to accomplish the task of averaging together multiple sweeps, but it needs to be done with a
-    moving average approach because the x values won't necessarily be identical between sweeps because they come from an
-    analog input channel and not a consistent timebase.
-    """
-    x3 = []
-    y3 = []
-    moving_avg_size = num_ramps * ramp_jaggedness / 2
-    avg = Queue.Queue(maxsize=moving_avg_size)
-    curr_total = 0
-    for i in range(moving_avg_size / 2):
-        avg.put(xy_pairs[i][1])
-        curr_total += xy_pairs[i][1]
-    for i in tqdm(range(len(x2)), ascii=True):
-        adjusted_index = i + moving_avg_size / 2
-        if avg.full() or adjusted_index > moving_avg_size:
-            curr_total -= avg.get()
-        if adjusted_index < len(x2):
-            avg.put(xy_pairs[adjusted_index][1])
-            curr_total += xy_pairs[adjusted_index][1]
-        x3.append(xy_pairs[i][0])
-        y3.append(curr_total / avg.qsize() - yb[i])
-
-    """
-    The signal tends to behave weirdly at the edges due to the way the moving averages are done; trim the edges by
-    an amount equal to the BG-subtraction window size 
-    """
-    x4 = [x3[i] for i in range(bg_avg_size, len(x3) - bg_avg_size)]
-    y4 = [y3[i] for i in range(bg_avg_size, len(y3) - bg_avg_size)]
+    print "Found {} valid sweeps, filtered {} points to {}".format(num_ramps, len(x1), len(x2))
 
     # Plotting code to show processed data for visual checking
-    plt.scatter(x4, y4, s=0.5)
+    plt.scatter(x2, y2[0], s=0.5, color='m')
+    plt.scatter(x2, y2[1], s=0.5, color='b')
     plt.xlabel('Ramp Voltage (V)')
-    plt.ylabel('Preamp Output (V)')
-    plt.title('Data after filtering and averaging')
+    plt.ylabel('ULE PD (V)')
+    plt.title('Data after filtering')
     plt.show()
 
     # Append both data sets together and save to a file.  Further processing should assume x and y of equal lengths due
     # to the data formatting, which is a list of (x,y) points
-    data_file = open(save_to_file_name, mode='wb+')
-    numpy.save(data_file, numpy.append(x4, y4))
-    print 'Data saved to file "{}"'.format(save_to_file_name)
+    if save_to_file_name is not None:
+        data_file = open(save_to_file_name, mode='wb+')
+        header_info = [1 + len(y2), len(x2)]
+        numpy.save(data_file, numpy.append(header_info, numpy.append(x2, y2)))
+        print 'Data saved to file "{}"'.format(save_to_file_name)
 
-    return [(x3[i], y3[i]) for i in range(len(x3))]
+    return [x2, y2]
+
+
+def average_spectroscopy_signal(x_val, spectroscopy_signal):
+    """
+    Takes the very large number of data points from the spectroscopy signal and averages them together into something
+    tractable, with error bars corresponding to the measurement spread.
+
+    :param x_val:                   List of x values
+    :param spectroscopy_signal:     List of y values corresponding to the spectroscopy signal, same length as x_val
+    """
+    plt.scatter(x_val, spectroscopy_signal, s=0.5, color='m')
+    plt.xlabel('Ramp Voltage (V)')
+    plt.ylabel('ULE PD (V)')
+    plt.title('Data after filtering')
+    plt.show()
 
 
 def get_peak_locations_and_heights(Ag, Bg, Ae, Be, x_offset, y_scale):
@@ -708,63 +547,48 @@ def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_B
 
 # Read data from the analog in
 data_time = 20
-sampleRateInHz = 500000
-numChannels = 2
+sampleRateInHz = 100000
+numChannels = 3
 numSamples = data_time * sampleRateInHz
-curr_file = "new_data.npy"
-# Data acquisition and filtering/combining temporarily commented out
-# sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
-# freq, signal = combine_raw_data(curr_file)
-# process_data(freq, signal, "new_combined_reverse.npy")
+#curr_file = "805MHz.npy"
+#sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
 
-# Quick-and-dirty trimming and rescaling of raw data to visually fit the calculated curve
-# x_plot, plot_data = read_spectroscopy_data("new_combined.npy", 24.5e5, 38.1e5)
-# plot_data = [14 * val + 0.2 for val in plot_data]
-# x_plot = numpy.linspace(545, -485, len(plot_data))
-x_plot, plot_data = read_spectroscopy_data("new_combined_reverse.npy", 0.0e5, 22.0e5)
-plot_data = [24 * val + 0.35 for val in plot_data]
-x_plot = numpy.linspace(470, -480, len(plot_data))
+#time_series, analog = read_data_from_file(curr_file, False)
+#ramp_data, spectroscopy_data, cavity_data = analog
+#x_filtered, analog_filtered = process_data(time_series, ramp_data, [spectroscopy_data, cavity_data], "pr805.npy")
 
-# First point is duplicated since it's assumed to be two degenerate peaks.  This is roughly consistent with its height
-data_freq = [142.8, 142.8, 211.6, 244.1, 325.8, 461.1, 552.1, 563.1]
-# The next line is meant to force the fitting to match the taken data better
-# data_freq = [142.8, 142.8, 220. , 254. , 332. , 458. , 552.1, 563.1]
-# data_freq = [-225.2, -225.2, -134.8, -97.3, -6.8, 127.9, 211.8, 223.2]
-data_freq = [-803.5, -803.5, -717.5, -677.0, -589.0, -459.0, -368.0, -356.0]
-# data_uncertainty = [5.4, 5.4, 4.9, 3.2, 4.8, 4.1, 4.9, 4.4]
-# data_uncertainty = [5.5, 5.5, 5.6, 5.5, 5.6, 5.4, 5.6, 5.6]
-data_uncertainty = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 2.0]
-# Beat frequency is in the IR, actual spectroscopy is in the blue after SHG
-measured_freq = [2*(f+580) for f in data_freq]
-measured_uncertainty = [2*f for f in data_uncertainty]
-A_ground = 800.583645
-B_ground = -1668.00527
+data_file = open("pr590.npy", mode='rb+')
+all_data = numpy.load(data_file)
+num_channels = int(all_data[0])
+channel_length = int(all_data[1])
+all_data = all_data[2:]
+print "Loading data from {} channels with length {}".format(num_channels, channel_length)
+x_filtered = all_data[0: channel_length]
+analog_filtered = all_data[channel_length: 2 * channel_length]
 
-'''
-A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq,
-                                                                     800.583645,
-                                                                     -1668.00527,
-                                                                     715.8,
-                                                                     1027)'''
-A_ground, B_ground, A_fitted, B_fitted = 800.583645, -1668.00527, 715.87337, 1024.67725
-A_div = 0.1
-B_div = 10
-generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
+print "Sorting data"
+zipped = zip(x_filtered, analog_filtered)
+zipped.sort()
+x_filtered = [x for x, y in zipped]
+analog_filtered = [y for x, y in zipped]
 
-print "Plotting with Ag={} and Bg={}".format(A_ground, B_ground)
-print "              Ae={} and Be={}".format(A_fitted, B_fitted)
-calc_transitions = get_peak_locations(A_ground, B_ground, A_fitted, B_fitted)
-calc_transitions.sort()
-adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
-measured_freq.sort()
+print "Binning data"
+x_bin = []
+y_bin = []
+x_error = []
+y_error = []
+bin_size = 5000
+for index in tqdm(range(0, channel_length, bin_size), ascii=True):
+    max_index = min(channel_length, index + bin_size)
+    x_window = [x_filtered[i] for i in range(index, max_index)]
+    y_window = [analog_filtered[i] for i in range(index, max_index)]
+    x_avg = sum(x for x in x_window) / len(x_window)
+    y_avg = sum(x for x in y_window) / len(y_window)
+    y_stdev = pow(sum(pow(x - y_avg, 2) for x in y_window) / len(y_window), 0.5)
+    x_bin.append(x_avg)
+    y_bin.append(y_avg)
+    x_error.append((max(x_window) - min(x_window)) / 2)
+    y_error.append(y_stdev)
+plt.errorbar(x_bin, y_bin, xerr=x_error, yerr=y_error, color='b')
+plt.show()
 
-# Chi-squared value calculation
-print "Measured frequencies: {}".format(measured_freq)
-print "Calculated shifted frequencies: {}".format(adjusted)
-chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
-print "chi2 value = {}".format(chi2)
-
-# Generate plot
-shift = calc_transitions[0] - adjusted[0]
-fitted_transitions = get_peak_locations_and_heights(A_ground, B_ground, A_fitted, B_fitted, shift, 1)
-saturated_absorption_signal(fitted_transitions, 13, measured_freq, x_other=x_plot, y_other=plot_data)
