@@ -7,11 +7,18 @@ from tqdm import tqdm
 from sympy.physics.wigner import wigner_6j
 import math
 import time
+from scipy.optimize import curve_fit
 
 # Atomic structure parameters (exact spin values, assumed ground state hyperfine)
 I = 7 / 2.
 Jg = 15 / 2.
 Je = 17 / 2.
+
+def lorentzian(x, x0, base, width, h):
+    """
+    This is a generic Lorentzian line shape with argumenr x, center x0, vertical shift base, linewidth width, height h
+    """
+    return h / (1 + pow((x - x0) / width, 2)) + base
 
 
 def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name):
@@ -103,7 +110,8 @@ def read_data_from_file(read_from_file_name, show_plots):
     header, then assumes the frequency counter shares the same time base.  Then, assuming that the analog data is a
     function y(t) and the counter data is x(t), combines them together in order to produce data of the form y(x)
 
-    :param read_from_file_name:     Name of the file to read data from, assumed to be in the local directory.
+    :param read_from_file_name:     Name of the file to read data from, assumed to be in the local directory
+    :param show_plots:              Whether or not to show plots after reading data
     :return:                        Combined and filtered data in the format x,y
     """
     # Read all the data parameters out, parsing the header data appropriately
@@ -393,6 +401,63 @@ def get_nearest_differences(measured, calculated):
     return [abs(meas[i] - calc[i]) for i in range(len(meas))]
 
 
+def load_and_get_error_bars(file_name, analog_channel_index, bin_size, trim_fractions):
+    """
+    Load data which has already been processed in such a way to line up ULE cavity peaks on successive sweeps with each
+    other.  This data is assumed to have the formatting from process_data() which is
+        [ num_channels, samples_per_channel, ch0[0], ch0[1], ... , ch0[n], ch1[0], ch1[1], ... ]
+    The data is arranged in such a way that the x values repeatedly sweep over the range, so this function sorts them in
+    ascending order.  Finally, it filters the data down using bins of the specified size and calculates error bars.
+
+    :param file_name:               Name of the file to load the data from
+    :param analog_channel_index:    This function only pulls from one analog channel, this parameter specifies which one
+    :param bin_size:                Number of data points per bin for output data points
+    :param trim_fractions:          A pair of numbers [left, right] which specify what proportion of data should be
+        excluded on the left and right sides; for example [0.1, 0.2] will exclude the leftmost 10% and rightmost 20%
+    :return:                        An array of arrays, containing [x_avg, y_avg, x_err, y_err] of all equal sizes
+    """
+
+    data_file = open(file_name, mode='rb+')
+    all_data = numpy.load(data_file)
+    num_channels = int(all_data[0])
+    channel_length = int(all_data[1])
+    all_data = all_data[2:]
+    print "Loading data from {} channels with length {}".format(num_channels, channel_length)
+    x_filtered = all_data[0: channel_length]
+    analog_filtered = all_data[(analog_channel_index + 1) * channel_length: (analog_channel_index + 2) * channel_length]
+
+    # Sort the data points by x value
+    zipped = zip(x_filtered, analog_filtered)
+    zipped.sort()
+    x_filtered = [x for x, y in zipped]
+    analog_filtered = [y for x, y in zipped]
+
+    print "Binning data"
+    x_bin = []
+    y_bin = []
+    x_error = []
+    y_error = []
+    for index in tqdm(range(0, channel_length, bin_size), ascii=True):
+        max_index = min(channel_length, index + bin_size)
+        x_window = [x_filtered[i] for i in range(index, max_index)]
+        y_window = [analog_filtered[i] for i in range(index, max_index)]
+        x_avg = sum(x for x in x_window) / len(x_window)
+        y_avg = sum(x for x in y_window) / len(y_window)
+        y_stdev = pow(sum(pow(x - y_avg, 2) for x in y_window) / len(y_window), 0.5)
+        x_bin.append(x_avg)
+        y_bin.append(y_avg)
+        x_error.append((max(x_window) - min(x_window)) / 2)
+        y_error.append(y_stdev)
+
+    start = int(trim_fractions[0] * len(x_bin))
+    end = int((1 - trim_fractions[1]) * len(x_bin))
+    x_bin = [x_bin[i] for i in range(start, end)]
+    y_bin = [y_bin[i] for i in range(start, end)]
+    x_error = [x_error[i] for i in range(start, end)]
+    y_error = [y_error[i] for i in range(start, end)]
+    return x_bin, y_bin, x_error, y_error
+
+
 def calculate_error_metric(value_list):
     """
     Given a list of values corresponding to differences between peak heights, calculate an appropriate error metric for
@@ -545,50 +610,87 @@ def find_hyperfine_coefficients(measured_freq, init_Ag, init_Bg, init_Ae, init_B
     return curr_Ag, curr_Bg, curr_Ae, curr_Be
 
 
+def get_freq_scale(x_val1, ule_val1, x_val2, ule_val2):
+    """
+    Takes in two sets of data containing a horizontal scale (x_val), a series of transmission data (ule_val), and a
+    frequency reference taken to be where the peak is "supposed" to be.  It takes these two values together
+
+    :param x_val1:      x values for the first peak
+    :param ule_val1:    transmission values for the first peak
+    :param x_val2:      x values for the second peak
+    :param ule_val2:    transmission values for the second peak
+    :return:            A pair of fitted [x_val1, x_val2] which correspond to where the ULE peaks fall on the x scale
+    """
+    max1 = max(ule_val1)
+    max_index1 = ule_val1.index(max1)
+    p_opt1, _ = curve_fit(lorentzian, x_val1, ule_val1,
+                             bounds=([x_val1[max_index1] - 0.002, 0.00, 0.000, 0.8 * max1],
+                             [x_val1[max_index1] + 0.002, 0.05, 0.0005, 1.2 * max1]))
+    max2 = max(ule_val2)
+    max_index2 = ule_val2.index(max2)
+    p_opt2, _ = curve_fit(lorentzian, x_val2, ule_val2,
+                             bounds=([x_val2[max_index2] - 0.002, 0.00, 0.000, 0.8 * max2],
+                             [x_val2[max_index2] + 0.002, 0.05, 0.0005, 1.2 * max2]))
+    return p_opt1[0], p_opt2[0]
+
+
 # Read data from the analog in
 data_time = 20
 sampleRateInHz = 100000
 numChannels = 3
 numSamples = data_time * sampleRateInHz
-#curr_file = "805MHz.npy"
+curr_file = "455MHz.npy"
 #sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
 
 #time_series, analog = read_data_from_file(curr_file, False)
 #ramp_data, spectroscopy_data, cavity_data = analog
-#x_filtered, analog_filtered = process_data(time_series, ramp_data, [spectroscopy_data, cavity_data], "pr805.npy")
+#x_filtered, analog_filtered = process_data(time_series, ramp_data, [spectroscopy_data, cavity_data], "pr455.npy")
 
-data_file = open("pr590.npy", mode='rb+')
-all_data = numpy.load(data_file)
-num_channels = int(all_data[0])
-channel_length = int(all_data[1])
-all_data = all_data[2:]
-print "Loading data from {} channels with length {}".format(num_channels, channel_length)
-x_filtered = all_data[0: channel_length]
-analog_filtered = all_data[channel_length: 2 * channel_length]
+freq1 = 455
+freq2 = 460
+file1 = "pr{}.npy".format(freq1)
+file2 = "pr{}.npy".format(freq2)
+trim_fractions = [0.3, 0]
+x_bin1, y_bin1, x_error1, y_error1 = load_and_get_error_bars(file1, 0, 5000, trim_fractions)
+u1, ule1, _, _ = load_and_get_error_bars(file1, 1, 200, trim_fractions)
+x_bin2, y_bin2, x_error2, y_error2 = load_and_get_error_bars(file2, 0, 5000, trim_fractions)
+u2, ule2, _, _ = load_and_get_error_bars(file2, 1, 200, trim_fractions)
 
-print "Sorting data"
-zipped = zip(x_filtered, analog_filtered)
-zipped.sort()
-x_filtered = [x for x, y in zipped]
-analog_filtered = [y for x, y in zipped]
+# Vertical shifts to match their averages
+print "Shifting data to match"
+padding = len(x_bin1) / 5
+avg1 = sum(y_bin1[i] for i in range(padding, len(y_bin1) - padding)) / (len(y_bin1) - 2 * padding)
+v_shift = avg1 - sum(y_bin2[i] for i in range(padding, len(y_bin2) - padding)) / (len(y_bin2) - 2 * padding)
+y_bin2 = [y_bin2[i] + v_shift for i in range(len(y_bin2))]
 
-print "Binning data"
-x_bin = []
-y_bin = []
-x_error = []
-y_error = []
-bin_size = 5000
-for index in tqdm(range(0, channel_length, bin_size), ascii=True):
-    max_index = min(channel_length, index + bin_size)
-    x_window = [x_filtered[i] for i in range(index, max_index)]
-    y_window = [analog_filtered[i] for i in range(index, max_index)]
-    x_avg = sum(x for x in x_window) / len(x_window)
-    y_avg = sum(x for x in y_window) / len(y_window)
-    y_stdev = pow(sum(pow(x - y_avg, 2) for x in y_window) / len(y_window), 0.5)
-    x_bin.append(x_avg)
-    y_bin.append(y_avg)
-    x_error.append((max(x_window) - min(x_window)) / 2)
-    y_error.append(y_stdev)
-plt.errorbar(x_bin, y_bin, xerr=x_error, yerr=y_error, color='b')
+# Shift all data to have zero baseline
+y_bin1 = [y_bin1[i] - min(y_bin1) for i in range(len(y_bin1))]
+y_bin2 = [y_bin2[i] - min(y_bin2) for i in range(len(y_bin2))]
+ule1 = [ule1[i] - min(ule1) for i in range(len(ule1))]
+ule2 = [ule2[i] - min(ule2) for i in range(len(ule2))]
+
+# Find the optimal horizontal shift to match the two data sets
+max1 = y_bin1.index(max(y_bin1))
+max2 = y_bin2.index(max(y_bin2))
+shift = 2 * (max2 - max1) * (x_bin1[1] - x_bin1[0])
+x_bin2 = [x_bin2[i] - shift for i in range(len(x_bin2))]
+u2 = [u2[i] - shift for i in range(len(u2))]
+
+# Rescale the horizontal scale to indicate frequency, based on ULE peak locations
+x_peak1, x_peak2 = get_freq_scale(u1, ule1, u2, ule2)
+scale = (freq2 - freq1) / (x_peak2 - x_peak1)
+x_bin1 = [(x_bin1[i] - x_peak1) * scale + freq1 for i in range(len(x_bin1))]
+x_bin2 = [(x_bin2[i] - x_peak2) * scale + freq2 for i in range(len(x_bin2))]
+
+p_opt, p_cov = curve_fit(lorentzian, x_bin1 + x_bin2, y_bin1 + y_bin2, sigma=y_error1 + y_error2,
+                         bounds=([freq1 - 10, 0.00,  3, 0.1],
+                                 [freq2 + 10, 0.05, 15, 0.2]))
+print p_opt
+print numpy.sqrt(numpy.diag(p_cov))
+
+plt.errorbar(x_bin1, y_bin1, xerr=x_error1, yerr=y_error1, color='b')
+plt.errorbar(x_bin2, y_bin2, xerr=x_error2, yerr=y_error2, color='r')
+plt.plot(x_bin1, lorentzian(x_bin1, *p_opt), color='k')
+plt.xlabel('Frequency (MHz)')
+plt.ylabel("Absorption signal (arb)")
 plt.show()
-
