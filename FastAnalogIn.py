@@ -14,11 +14,18 @@ I = 7 / 2.
 Jg = 15 / 2.
 Je = 17 / 2.
 
-def lorentzian(x, x0, base, width, h):
+def lorentzian(x, x0, width, base, h):
     """
     This is a generic Lorentzian line shape with argumenr x, center x0, vertical shift base, linewidth width, height h
     """
     return h / (1 + pow((x - x0) / width, 2)) + base
+
+
+def double_peak(x, x1, x2, w1, w2, h1, h2, base):
+    """
+    Sum of two lorentzians, used for the double-peak, assumed to have the same base value
+    """
+    return lorentzian(x, x1, w1, base, h1) + lorentzian(x, x2, w2, base, h2)
 
 
 def sample_data(num_samples, sample_rate_in_hz, num_channels, save_to_file_name):
@@ -623,14 +630,21 @@ def get_freq_scale(x_val1, ule_val1, x_val2, ule_val2):
     """
     max1 = max(ule_val1)
     max_index1 = ule_val1.index(max1)
-    p_opt1, _ = curve_fit(lorentzian, x_val1, ule_val1,
-                             bounds=([x_val1[max_index1] - 0.002, 0.00, 0.000, 0.8 * max1],
-                             [x_val1[max_index1] + 0.002, 0.05, 0.0005, 1.2 * max1]))
+    weights1 = [1 / (ule_val1[i] + 1e-8) for i in range(len(ule_val1))]
+    p_opt1, _ = curve_fit(lorentzian, x_val1, ule_val1, sigma=weights1, p0=[x_val1[max_index1], 0.00005, 0, max1])
     max2 = max(ule_val2)
     max_index2 = ule_val2.index(max2)
-    p_opt2, _ = curve_fit(lorentzian, x_val2, ule_val2,
-                             bounds=([x_val2[max_index2] - 0.002, 0.00, 0.000, 0.8 * max2],
-                             [x_val2[max_index2] + 0.002, 0.05, 0.0005, 1.2 * max2]))
+    weights2 = [1 / (ule_val2[i] + 1e-8) for i in range(len(ule_val2))]
+    p_opt2, _ = curve_fit(lorentzian, x_val2, ule_val2, sigma=weights2, p0=[x_val2[max_index2], 0.00005, 0, max2])
+
+    plt.errorbar(x_val1, ule_val1, color='b')
+    plt.errorbar(x_val2, ule_val2, color='r')
+    plt.plot(x_bin1, lorentzian(x_bin1, *p_opt1), color='k')
+    plt.plot(x_bin2, lorentzian(x_bin2, *p_opt2), color='k')
+    plt.xlabel('Ramp Voltage (V)')
+    plt.ylabel("ULE signal (arb)")
+    plt.show()
+
     return p_opt1[0], p_opt2[0]
 
 
@@ -639,22 +653,23 @@ data_time = 20
 sampleRateInHz = 100000
 numChannels = 3
 numSamples = data_time * sampleRateInHz
-curr_file = "455MHz.npy"
+curr_file = "680MHz.npy"
 #sample_data(numSamples, sampleRateInHz, numChannels, curr_file)
 
 #time_series, analog = read_data_from_file(curr_file, False)
 #ramp_data, spectroscopy_data, cavity_data = analog
 #x_filtered, analog_filtered = process_data(time_series, ramp_data, [spectroscopy_data, cavity_data], "pr455.npy")
 
-freq1 = 455
-freq2 = 460
+'''
+freq1 = 355
+freq2 = 360
 file1 = "pr{}.npy".format(freq1)
 file2 = "pr{}.npy".format(freq2)
-trim_fractions = [0.3, 0]
+trim_fractions = [0.4, 0.05]
 x_bin1, y_bin1, x_error1, y_error1 = load_and_get_error_bars(file1, 0, 5000, trim_fractions)
-u1, ule1, _, _ = load_and_get_error_bars(file1, 1, 200, trim_fractions)
+u1, ule1, _, _ = load_and_get_error_bars(file1, 1, 500, trim_fractions)
 x_bin2, y_bin2, x_error2, y_error2 = load_and_get_error_bars(file2, 0, 5000, trim_fractions)
-u2, ule2, _, _ = load_and_get_error_bars(file2, 1, 200, trim_fractions)
+u2, ule2, _, _ = load_and_get_error_bars(file2, 1, 500, trim_fractions)
 
 # Vertical shifts to match their averages
 print "Shifting data to match"
@@ -672,7 +687,7 @@ ule2 = [ule2[i] - min(ule2) for i in range(len(ule2))]
 # Find the optimal horizontal shift to match the two data sets
 max1 = y_bin1.index(max(y_bin1))
 max2 = y_bin2.index(max(y_bin2))
-shift = 2 * (max2 - max1) * (x_bin1[1] - x_bin1[0])
+shift = x_bin2[max2] - x_bin1[max1]
 x_bin2 = [x_bin2[i] - shift for i in range(len(x_bin2))]
 u2 = [u2[i] - shift for i in range(len(u2))]
 
@@ -680,17 +695,67 @@ u2 = [u2[i] - shift for i in range(len(u2))]
 x_peak1, x_peak2 = get_freq_scale(u1, ule1, u2, ule2)
 scale = (freq2 - freq1) / (x_peak2 - x_peak1)
 x_bin1 = [(x_bin1[i] - x_peak1) * scale + freq1 for i in range(len(x_bin1))]
-x_bin2 = [(x_bin2[i] - x_peak2) * scale + freq2 for i in range(len(x_bin2))]
+x_bin2 = [(x_bin2[i] - x_peak1) * scale + freq1 for i in range(len(x_bin2))]
+u1 = [(u1[i] - x_peak1) * scale + freq1 for i in range(len(u1))]
+u2 = [(u2[i] - x_peak1) * scale + freq1 for i in range(len(u2))]
 
-p_opt, p_cov = curve_fit(lorentzian, x_bin1 + x_bin2, y_bin1 + y_bin2, sigma=y_error1 + y_error2,
-                         bounds=([freq1 - 10, 0.00,  3, 0.1],
-                                 [freq2 + 10, 0.05, 15, 0.2]))
+"""
+p_opt, p_cov = curve_fit(lorentzian, x_bin1 + x_bin2, y_bin1 + y_bin2,
+                         sigma=y_error1 + y_error2,
+                         p0=[(freq1 + freq2) / 2, 8, 0.005, 0.005],
+                         absolute_sigma=True)
+"""
+p_opt, p_cov = curve_fit(double_peak, x_bin1 + x_bin2, y_bin1 + y_bin2,
+                         sigma=y_error1 + y_error2,
+                         p0=[freq1 - 10, freq2 + 10, 8, 8, 0.005, 0.005, 0.005],
+                         absolute_sigma=True)
 print p_opt
 print numpy.sqrt(numpy.diag(p_cov))
 
 plt.errorbar(x_bin1, y_bin1, xerr=x_error1, yerr=y_error1, color='b')
 plt.errorbar(x_bin2, y_bin2, xerr=x_error2, yerr=y_error2, color='r')
-plt.plot(x_bin1, lorentzian(x_bin1, *p_opt), color='k')
+plt.plot(u1, ule1, color='b')
+plt.plot(u2, ule2, color='r')
+plt.plot(x_bin1, double_peak(x_bin1, *p_opt), color='k')
 plt.xlabel('Frequency (MHz)')
 plt.ylabel("Absorption signal (arb)")
 plt.show()
+'''
+
+# Raw data for peaks (first point is duplicated due to suspected unresolvable degeneracy)
+peak_center = [801.896072, 801.896072, 715.628924, 675.398271, 589.209671, 458.649419, 369.267661, 356.108890]
+peak_error  = [0.14098133*2, 0.14098133*2, 0.37996701, 0.35682198, 0.25559928, 0.35724911, 0.23646377, 1.26516031]
+width_val   = [6.13142913, 5.85179708, 6.73240544, 5.16606851, 6.33494503, 5.37464084, 12.9314158]
+width_error = [0.27447788, 0.85714615, 0.79432299, 0.50068370, 0.76092204, 0.50376218, 1.92889126]
+
+# First point is duplicated since it's assumed to be two degenerate peaks.  This is roughly consistent with its height
+# Beat frequency is in the IR, actual spectroscopy is in the blue after SHG
+measured_freq = [2*(-f+580) for f in peak_center]
+measured_uncertainty = [2*f for f in peak_error]
+A_ground = 800.583645
+B_ground = -1668.00527
+
+"""
+A_ground, B_ground, A_fitted, B_fitted = find_hyperfine_coefficients(measured_freq,
+                                                                     800.583645,
+                                                                     -1668.00527,
+                                                                     715.8,
+                                                                     1027)"""
+A_ground, B_ground, A_fitted, B_fitted = 800.583645, -1668.00527, 715.853717911, 1015.37268961
+A_div = 0.1
+B_div = 10
+# generate_contour_plot(measured_freq, A_fitted - A_div, A_fitted + A_div, B_fitted - B_div, B_fitted + B_div, 20)
+
+print "Plotting with Ag={} and Bg={}".format(A_ground, B_ground)
+print "              Ae={} and Be={}".format(A_fitted, B_fitted)
+calc_transitions = get_peak_locations(A_ground, B_ground, A_fitted, B_fitted)
+calc_transitions.sort()
+adjusted = adjust_offset_to_minimize_error(measured_freq, calc_transitions)
+measured_freq.sort()
+
+# Chi-squared value calculation
+print "Measured frequencies: {}".format(measured_freq)
+print "Calculated shifted frequencies: {}".format(adjusted)
+print "Differences: {}".format([(measured_freq[i] - adjusted[i]) / 2 for i in range(8)])
+chi2 = sum(pow((measured_freq[i] - adjusted[i]) / measured_uncertainty[i], 2) for i in range(len(measured_freq)))
+print "chi2 value = {}".format(chi2)
